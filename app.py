@@ -138,8 +138,9 @@ def status(request: Request):
 class Login(BaseModel):
     username: str = ""
     password: str = ""
+    code: str = ""  # authenticator code up front, if you use one: saves a second login attempt
     sessionid: str = ""
-    timezone_offset: int = 0
+    timezone: str = "UTC"
     locale: str = ""
 
 
@@ -150,8 +151,8 @@ class Code(BaseModel):
 @app.post("/api/connect")
 def connect(body: Login):
     if body.sessionid:
-        return login_flow.with_sessionid(body.sessionid, body.timezone_offset, body.locale)
-    return login_flow.start(body.username, body.password, body.timezone_offset, body.locale)
+        return login_flow.with_sessionid(body.sessionid, body.timezone, body.locale)
+    return login_flow.start(body.username, body.password, body.code, body.timezone, body.locale)
 
 
 @app.post("/api/connect/code")
@@ -193,8 +194,8 @@ def cooling_down(request, exc: CoolingDown):
 
 
 @app.exception_handler(DailyLimit)
-def daily_limit(request, exc):
-    return err(429, "daily_limit", "That's today's limit for follows and likes. It resets at midnight.")
+def daily_limit(request, exc: DailyLimit):
+    return err(429, "limit", f"That's the limit for {exc.what} {exc.per}. It keeps your account safe.")
 
 
 @app.exception_handler(ClientError)
@@ -407,7 +408,7 @@ class Ids(BaseModel):
 @app.post("/api/stories/seen")
 def stories_seen(body: Ids):
     if body.ids:
-        ig.run(lambda cl: cl.story_seen([int(i) for i in body.ids]))
+        ig.run(lambda cl: cl.story_seen([int(i) for i in body.ids]), kind="seen")
     return {"ok": True}
 
 
@@ -418,9 +419,9 @@ class Follow(BaseModel):
 @app.post("/api/u/{user_id}/follow")
 def follow(user_id: str, body: Follow):
     if body.follow:
-        ig.run(lambda cl: cl.user_follow(user_id), write=True, counts=True)
+        ig.run(lambda cl: cl.user_follow(user_id), kind="follow")
     else:
-        ig.run(lambda cl: cl.user_unfollow(user_id), write=True, counts=True)
+        ig.run(lambda cl: cl.user_unfollow(user_id), kind="follow")
     ig.forget(f"rel:{user_id}", "user:")
     rel = ig.run(lambda cl: cl.user_friendship_v1(user_id))
     return {"following": rel.following, "followed_by": rel.followed_by, "requested": rel.outgoing_request}
@@ -447,7 +448,7 @@ class Like(BaseModel):
 
 @app.post("/api/p/{media_pk}/like")
 def like(media_pk: str, body: Like):
-    ig.run(lambda cl: cl.media_like(body.media_id, revert=not body.like), write=True, counts=True)
+    ig.run(lambda cl: cl.media_like(body.media_id, revert=not body.like), kind="like")
     ig.forget(f"media:{media_pk}")
     return {"liked": body.like}
 
@@ -472,7 +473,7 @@ def thread(thread_id: str, n: int = 30):
     t = ig.cached(f"thread:{thread_id}:{n}", 4, lambda cl: cl.direct_thread(int(thread_id), amount=n))
     messages = sorted(t.messages, key=lambda m: m.timestamp)
     if messages and not messages[-1].is_sent_by_viewer and not t.pending and not t.is_seen(my_id):
-        ig.run(lambda cl: cl.direct_send_seen(int(thread_id)))
+        ig.run(lambda cl: cl.direct_send_seen(int(thread_id)), kind="seen")
         ig.forget("inbox:")
     return {**thread_json(t, my_id), "messages": [message_json(m, my_id) for m in messages], "n": n}
 
@@ -485,15 +486,15 @@ class Send(BaseModel):
 @app.post("/api/dm/{thread_id}/send")
 def send(thread_id: str, body: Send):
     if body.accept:
-        ig.run(lambda cl: cl.direct_pending_approve(int(thread_id)), write=True)
-    msg = ig.run(lambda cl: cl.direct_send(body.text.strip(), thread_ids=[int(thread_id)]), write=True)
+        ig.run(lambda cl: cl.direct_pending_approve(int(thread_id)), kind="other")
+    msg = ig.run(lambda cl: cl.direct_answer(int(thread_id), body.text.strip()), kind="dm")
     ig.forget(f"thread:{thread_id}:", "inbox:")
     return message_json(msg, ig.user_id)
 
 
 @app.post("/api/dm/to/{user_id}")
 def send_to_user(user_id: str, body: Send):
-    msg = ig.run(lambda cl: cl.direct_send(body.text.strip(), user_ids=[int(user_id)]), write=True)
+    msg = ig.run(lambda cl: cl.direct_send(body.text.strip(), user_ids=[int(user_id)]), kind="dm_new")
     ig.forget("inbox:")
     return {"thread_id": str(msg.thread_id) if msg.thread_id else None}
 
@@ -528,9 +529,9 @@ def new_post(photo: UploadFile = File(...), caption: str = Form(""), where: str 
     path = prepare_photo(photo, for_story)
     try:
         if for_story:
-            ig.run(lambda cl: cl.photo_upload_to_story(path), write=True)
+            ig.run(lambda cl: cl.photo_upload_to_story(path), kind="upload")
         else:
-            ig.run(lambda cl: cl.photo_upload(path, caption), write=True)
+            ig.run(lambda cl: cl.photo_upload(path, caption), kind="upload")
     finally:
         path.unlink(missing_ok=True)
     ig.forget("posts:", "stories:", "user:")

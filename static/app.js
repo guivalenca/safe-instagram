@@ -367,12 +367,12 @@ function Unlock({ done }) {
 function Connect({ done }) {
   const [step, setStep] = useState("login");
   const [kind, setKind] = useState("");
-  const [f, setF] = useState({ username: "", password: "", sessionid: "", code: "" });
+  const [f, setF] = useState({ username: "", password: "", sessionid: "", code: "", totp: "" });
   const [useCookie, setUseCookie] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
-  const device = { timezone_offset: -new Date().getTimezoneOffset() * 60, locale: navigator.language };
+  const device = { timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", locale: navigator.language };
 
   async function handle(promise) {
     setBusy(true);
@@ -394,7 +394,7 @@ function Connect({ done }) {
 
   const login = (e) => {
     e.preventDefault();
-    const body = useCookie ? { sessionid: f.sessionid, ...device } : { username: f.username, password: f.password, ...device };
+    const body = useCookie ? { sessionid: f.sessionid, ...device } : { username: f.username, password: f.password, code: f.totp, ...device };
     handle(api("/api/connect", { method: "POST", body }));
   };
   const code = (e) => {
@@ -412,7 +412,8 @@ function Connect({ done }) {
           ${useCookie
             ? html`<textarea rows="3" placeholder="sessionid cookie value" value=${f.sessionid} onInput=${set("sessionid")}></textarea>`
             : html`<input placeholder="Username" autocapitalize="off" autocorrect="off" autocomplete="username" value=${f.username} onInput=${set("username")} />
-                <input type="password" placeholder="Password" autocomplete="current-password" value=${f.password} onInput=${set("password")} />`}
+                <input type="password" placeholder="Password" autocomplete="current-password" value=${f.password} onInput=${set("password")} />
+                <input inputmode="numeric" autocomplete="one-time-code" placeholder="Authenticator code (only if you use one)" value=${f.totp} onInput=${set("totp")} />`}
           ${error && html`<p class="error">${error}</p>`}
           <button class="btn" disabled=${busy}>${busy ? "Logging in… this can take a moment" : "Log in"}</button>
           <button type="button" class="link small" onClick=${() => setUseCookie(!useCookie)}>

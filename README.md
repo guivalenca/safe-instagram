@@ -16,10 +16,21 @@ iPhone (home-screen app)  ──HTTPS──▶  Railway: app.py  ──▶  Inst
 ```
 
 - `app.py`: JSON API plus the passcode gate. Only the allowed features have endpoints.
-- `ig.py`: the only code that talks to Instagram. It reuses one saved session, serialises
-  calls, paces actions 2–4s apart, caps follows/likes at 40/day, and backs off for 30
-  minutes (throttling) or 24 hours (action block) when Instagram complains. It never
-  re-logs in on its own.
+- `ig.py`: the only code that talks to Instagram. It reuses one saved session and the same
+  emulated phone, serialises calls, and never logs in or answers a verification
+  challenge on its own. Actions are paced and capped per kind:
+
+  | Action | Min gap | Per hour | Per day |
+  |---|---|---|---|
+  | Follow / unfollow | 30 s | 8 | 20 |
+  | Like | 4 s | 30 | 70 |
+  | Message someone new | 20 s | 5 | 10 |
+  | Reply in a conversation | ~2 s | 60 | 300 |
+  | Post / story | 60 s | 3 | 5 |
+
+  When Instagram pushes back it stops: 30 minutes for throttling or repeated errors,
+  24 hours for an action block (72 hours for a second one within a week), and a full
+  stop if the account or IP is flagged.
 - `static/`: the app (Preact + htm, no build step). It caches everything locally, so screens
   open instantly and refresh quietly. Follow, like and send update the screen immediately.
 
@@ -29,11 +40,16 @@ iPhone (home-screen app)  ──HTTPS──▶  Railway: app.py  ──▶  Inst
 2. Add a **volume** mounted at `/data`. The Instagram session lives there and survives deploys.
 3. Set these variables:
    - `APP_PASSCODE`: what you type once per phone to unlock the app (6+ characters).
-   - `IG_PROXY` (optional): `http://user:pass@host:port` for a residential proxy, if Instagram
-     starts asking for verification from Railway's servers.
+   - `IG_PROXY` (recommended): `http://user:pass@host:port` for a **static** residential
+     ("ISP") proxy. Railway runs in a data center, and a data-center IP is the biggest
+     avoidable red flag. Use one fixed IP, not a rotating pool.
 4. Generate a domain, open it in Safari on the iPhone, tap Share → **Add to Home Screen**.
 5. Unlock with the passcode, then log in to Instagram. 2FA and "we sent you a code"
-   prompts are handled in the app.
+   prompts are handled in the app. If Instagram asks "Was this you?" in the official app,
+   approve it, and don't remove this device from "Where you're logged in".
+
+The app pins an exact instagrapi version because the library (and Instagram) change
+often. Upgrade only when something breaks.
 
 ## Running locally
 
