@@ -1078,13 +1078,18 @@ img.loaded,
   width: 72px;
   height: 72px;
   border-radius: 16px;
-  background: radial-gradient(circle at 30% 107%, rgb(234, 226, 141) 0%, rgb(234, 226, 141) 9%, rgb(224, 91, 78) 58%, rgb(175, 56, 139) 80%, rgb(51, 90, 203) 120%);
+  background: radial-gradient(circle at 5% 100%, rgba(96, 34, 112, 0.7), transparent 55%),
+    radial-gradient(circle at 22% 12%, rgba(112, 70, 186, 0.75), transparent 60%),
+    linear-gradient(135deg, #3a1c68, #180c30);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
   color: #fff;
 }
 .logo svg {
-  width: 38px;
-  height: 38px;
-  stroke-width: 2.1;
+  width: 72px;
+  height: 72px;
+  stroke-width: 1.6;
+  color: #f6f2fd;
+  filter: drop-shadow(0 1.5px 2px rgba(10, 4, 24, 0.55));
 }
 .logo .dot {
   fill: currentColor;
