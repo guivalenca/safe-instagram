@@ -371,7 +371,12 @@ def user_and_friendship(cl, username):
     user = extract_user_v1(dict(raw))
     if "following" not in fs:  # not included this time: ask separately
         r = cl.user_friendship_v1(user.pk)
-        fs = {"following": r.following, "followed_by": r.followed_by, "outgoing_request": r.outgoing_request}
+        fs = {
+            "following": r.following,
+            "followed_by": r.followed_by,
+            "outgoing_request": r.outgoing_request,
+            "incoming_request": r.incoming_request,
+        }
     return user, fs
 
 
@@ -379,7 +384,7 @@ def user_and_friendship(cl, username):
 def profile(username: str):
     u, fs = ig.cached(f"user:{username.lower()}", 120, user_and_friendship, username)
     me = str(u.pk) == ig.user_id
-    rel = None if me else SimpleNamespace(**{k: bool(fs.get(k)) for k in ("following", "followed_by", "outgoing_request")})
+    rel = None if me else SimpleNamespace(**{k: bool(fs.get(k)) for k in ("following", "followed_by", "outgoing_request", "incoming_request")})
     hd = s(u.profile_pic_url_hd)
     return {
         **user_short(u),
@@ -398,6 +403,7 @@ def profile(username: str):
             "following": rel.following,
             "followed_by": rel.followed_by,
             "requested": rel.outgoing_request,
+            "incoming": rel.incoming_request,  # they asked to follow you
         },
         "can_see": me or not u.is_private or rel.following,
     }

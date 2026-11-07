@@ -558,6 +558,21 @@ img.loaded,
   flex: 1;
 }
 
+.incoming {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 16px 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  font-size: 14px;
+}
+.incoming span {
+  flex: 1;
+  min-width: 0;
+}
+
 .requests-row {
   display: flex;
   align-items: center;

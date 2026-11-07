@@ -684,7 +684,25 @@ function ProfileActions({ p, k, onUnfollow }) {
     const t = threads.find((t) => !t.group && t.users.length === 1 && t.users[0].id === p.id);
     navigate(t ? `/dm/${t.id}` : `/dm/new/${encodeURIComponent(p.username)}`);
   };
-  return html`<div class="actions">
+  const answer = async (approve) => {
+    const before = store.get(k).data;
+    setData(k, { ...before, rel: { ...r, incoming: false, followed_by: approve } });
+    const reqs = store.get("/api/requests")?.data;
+    if (reqs) setData("/api/requests", reqs.filter((u) => u.id !== p.id));
+    try {
+      await api(`/api/requests/${p.id}`, { method: "POST", body: { approve } });
+    } catch (e) {
+      setData(k, before);
+      toast(e.message);
+    }
+  };
+  return html`${r.incoming &&
+    html`<div class="incoming">
+      <span><b>${p.username}</b> wants to follow you</span>
+      <button class="btn small" onClick=${() => answer(true)}>Confirm</button>
+      <button class="btn small secondary" onClick=${() => answer(false)}>Delete</button>
+    </div>`}
+  <div class="actions">
     ${r.following || r.requested
       ? html`<button class="btn secondary" onClick=${onUnfollow}>${r.requested ? "Requested" : "Following"}</button>`
       : html`<button class="btn" onClick=${() => follow(p, k, true)}>${r.followed_by ? "Follow back" : "Follow"}</button>`}
@@ -1393,4 +1411,12 @@ function App() {
 
 render(html`<${App} />`, document.getElementById("app"));
 
-if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("/sw.js");
+if ("serviceWorker" in navigator && location.protocol === "https:") {
+  // When a new version takes over, reload once so you're never a version behind.
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (hadController && !reloaded) (reloaded = true), location.reload();
+  });
+  navigator.serviceWorker.register("/sw.js");
+}
