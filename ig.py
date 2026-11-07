@@ -53,9 +53,16 @@ LIMITS = {
     "dm_new": (20, 5, 10),  # first message to someone
     "dm": (1.5, 60, 300),  # replies in an existing conversation
     "upload": (60, 3, 5),
+    "approve": (3, 40, 150),  # confirming / deleting follow requests
     "other": (3, 30, 100),  # accepting requests etc.
 }
-LIMIT_NAMES = {"follow": "follows", "like": "likes", "dm_new": "new conversations", "upload": "posts"}
+LIMIT_NAMES = {
+    "follow": "follows",
+    "like": "likes",
+    "dm_new": "new conversations",
+    "upload": "posts",
+    "approve": "follow request answers",
+}
 
 # How long to stop talking to Instagram after it pushes back.
 COOLDOWN_SOFT = dt.timedelta(minutes=30)  # "please wait a few minutes", throttling, repeated errors

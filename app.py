@@ -478,6 +478,29 @@ def image(u: str):
     )
 
 
+# -- follow requests -----------------------------------------------------------
+
+
+@app.get("/api/requests")
+def follow_requests():
+    users, _ = ig.cached("requests", 30, lambda cl: cl.user_follow_requests_chunk(50))
+    return [user_short(u) for u in users]
+
+
+class Decision(BaseModel):
+    approve: bool
+
+
+@app.post("/api/requests/{user_id}")
+def answer_request(user_id: str, body: Decision):
+    if body.approve:
+        ig.run(lambda cl: cl.user_follow_request_approve(user_id), kind="approve")
+    else:
+        ig.run(lambda cl: cl.user_follow_request_decline(user_id), kind="approve")
+    ig.forget("requests", "user:")
+    return {"ok": True}
+
+
 # -- single posts ------------------------------------------------------------
 
 

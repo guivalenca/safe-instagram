@@ -562,6 +562,7 @@ function Profile({ username }) {
       ${p?.rel?.followed_by && html`<small class="muted">Follows you</small>`}
     </section>
     ${p && !p.me && html`<${ProfileActions} p=${p} k=${key} onUnfollow=${() => setSheet(true)} />`}
+    ${p?.me && p.private && html`<${RequestsRow} />`}
     ${!p && html`<div class="actions"><button class="btn ghost" disabled>…</button></div>`}
     ${id && (p?.can_see ?? !u.private) && html`<${Highlights} userId=${id} username=${u.username} />`}
     ${p && !p.can_see
@@ -579,6 +580,64 @@ function Profile({ username }) {
       <button class="btn danger" onClick=${() => (setSheet(false), follow(p, key, false))}>${p.rel.requested ? "Cancel request" : "Unfollow"}</button>
       <button class="btn secondary" onClick=${() => setSheet(false)}>Cancel</button>
     <//>`}
+  </div>`;
+}
+
+function RequestsRow() {
+  const { data } = useQuery("/api/requests", 30000);
+  if (!data?.length) return null;
+  return html`<${Link} href="/requests" class="requests-row">
+    <span class=${`avatars n${Math.min(data.length, 2)}`}>${data.slice(0, 2).map((u) => html`<${Avatar} src=${u.pic} size=${data.length > 1 ? 30 : 40} />`)}</span>
+    <span class="row-text">
+      <b>Follow requests</b>
+      <small class="muted">${data[0].username}${data.length > 1 ? ` and ${data.length - 1} other${data.length > 2 ? "s" : ""}` : ""}</small>
+    </span>
+    <span class="count">${data.length >= 50 ? "50+" : data.length}</span>
+  <//>`;
+}
+
+function Requests() {
+  const key = "/api/requests";
+  const { data, error, refresh } = useQuery(key, 30000);
+  const ptr = usePullToRefresh(refresh);
+  const answer = async (u, approve) => {
+    const before = store.get(key).data;
+    setData(key, before.filter((x) => x.id !== u.id));
+    try {
+      await api(`/api/requests/${u.id}`, { method: "POST", body: { approve } });
+      if (approve) toast(`@${u.username} can now see your posts`);
+      dropData(`/api/u/${encodeURIComponent(me.username)}`);
+    } catch (e) {
+      setData(key, before);
+      toast(e.message);
+    }
+  };
+  return html`<div class="page">
+    <${TopBar} title="Follow requests" />
+    ${ptr}
+    ${!data
+      ? error
+        ? html`<${ErrorView} error=${error} retry=${refresh} />`
+        : html`<${Spinner} />`
+      : !data.length
+      ? html`<${Empty}><p class="muted">No one's waiting.</p><//>`
+      : html`<ul class="list">
+          ${data.map(
+            (u) => html`<li class="row" key=${u.id}>
+              <${Link} href=${`/u/${encodeURIComponent(u.username)}`} warm=${() => warmUser(u)} class="row-main">
+                <${Avatar} src=${u.pic} />
+                <span class="row-text">
+                  <${Name} u=${u} />
+                  <small class="muted">${u.name}</small>
+                </span>
+              <//>
+              <div class="row-actions">
+                <button class="btn small" onClick=${() => answer(u, true)}>Confirm</button>
+                <button class="btn small secondary" onClick=${() => answer(u, false)}>Delete</button>
+              </div>
+            </li>`
+          )}
+        </ul>`}
   </div>`;
 }
 
@@ -1206,6 +1265,7 @@ function route(path, search, status, refreshStatus) {
   if ((m = path.match(/^\/dm\/(\d+)$/))) return { bare: true, el: html`<${Thread} id=${m[1]} />` };
   if (path === "/new") return { tab: "new", el: html`<${NewPost} />` };
   if (path === "/me") return { tab: "me", el: html`<${Profile} username=${me.username} />` };
+  if (path === "/requests") return { tab: "me", el: html`<${Requests} />` };
   if (path === "/settings") return { tab: "me", el: html`<${Settings} status=${status} refreshStatus=${refreshStatus} />` };
   return { tab: "search", el: html`<${TopBar} title="" /><${Empty}><p class="muted">Nothing here.</p><//>` };
 }
