@@ -273,6 +273,7 @@ def media_full(m):
         "caption": m.caption_text or "",
         "taken_at": m.taken_at.isoformat(),
         "liked": bool(m.has_liked),
+        "saved": bool(m.viewer_has_saved),
         "likes": None if m.like_and_view_counts_disabled else m.like_count,
         "comments": m.comment_count or 0,
         "ratio": (dims.width / dims.height) if dims and dims.width and dims.height else None,
@@ -311,6 +312,10 @@ def message_json(m, my_id):
         "t": m.timestamp.isoformat(),
         "kind": m.item_type or "unknown",
         "text": None,
+        "context": m.client_context,
+        "reactions": [
+            {"emoji": r.emoji, "mine": str(r.sender_id) == my_id} for r in (m.reactions.emojis if m.reactions else [])
+        ],
     }
     if m.item_type == "text":
         out["text"] = m.text
@@ -384,6 +389,8 @@ def user_and_friendship(cl, username):
             "followed_by": r.followed_by,
             "outgoing_request": r.outgoing_request,
             "incoming_request": r.incoming_request,
+            "muting": r.muting,
+            "is_muting_reel": r.is_muting_reel,
         }
     return user, fs
 
@@ -392,7 +399,7 @@ def user_and_friendship(cl, username):
 def profile(username: str):
     u, fs = ig.cached(f"user:{username.lower()}", 120, user_and_friendship, username)
     me = str(u.pk) == ig.user_id
-    rel = None if me else SimpleNamespace(**{k: bool(fs.get(k)) for k in ("following", "followed_by", "outgoing_request", "incoming_request")})
+    rel = None if me else SimpleNamespace(**{k: bool(fs.get(k)) for k in ("following", "followed_by", "outgoing_request", "incoming_request", "muting", "is_muting_reel")})
     hd = s(u.profile_pic_url_hd)
     return {
         **user_short(u),
@@ -412,6 +419,8 @@ def profile(username: str):
             "followed_by": rel.followed_by,
             "requested": rel.outgoing_request,
             "incoming": rel.incoming_request,  # they asked to follow you
+            "muted_posts": rel.muting,
+            "muted_stories": rel.is_muting_reel,
         },
         "can_see": me or not u.is_private or rel.following,
     }
@@ -574,6 +583,8 @@ def feed_verdict(media: dict) -> str:
     fs = (media.get("user") or {}).get("friendship_status")
     if fs is None:
         return "keep_no_fs"  # Instagram didn't say; only people you follow are in the timeline otherwise
+    if fs.get("muting"):
+        return "muted"
     return "keep" if fs.get("following") else "not_following"
 
 
@@ -625,6 +636,8 @@ def daily_stories():
         fs = u.get("friendship_status") or {}
         if reel.get("reel_type", "user_reel") != "user_reel" or fs.get("following") is False or not u.get("username"):
             continue
+        if reel.get("muted") or fs.get("is_muting_reel"):  # stories you've muted
+            continue
         if str(u.get("pk") or u.get("pk_id")) == ig.user_id:
             continue
         unseen = (reel.get("seen") or 0) < (reel.get("latest_reel_media") or 0)
@@ -670,6 +683,75 @@ def post_by_code(code: str):
     return {"id": str(ig.cached(f"code:{code}", 86400, lambda cl: cl.media_pk_from_code(code)))}
 
 
+class Mute(BaseModel):
+    posts: bool | None = None
+    stories: bool | None = None
+
+
+@app.post("/api/u/{user_id}/mute")
+def mute(user_id: str, body: Mute):
+    if body.posts is not None:
+        ig.run(lambda cl: cl.mute_posts_from_follow(user_id, revert=not body.posts), kind="other")
+    if body.stories is not None:
+        ig.run(lambda cl: cl.mute_stories_from_follow(user_id, revert=not body.stories), kind="other")
+    ig.forget("user:", "daily:")
+    return {"ok": True}
+
+
+@app.get("/api/p/{media_pk}/comments")
+def comments(media_pk: str, media_id: str, cursor: str = ""):
+    items, nxt = ig.cached(
+        f"comments:{media_pk}:{cursor}",
+        120,
+        lambda cl: cl.media_comments_chunk(media_id, 20, min_id=cursor or None),
+        soft=True,
+    )
+    return {
+        "items": [
+            {
+                "id": c.pk,
+                "user": user_short(c.user),
+                "text": c.text,
+                "t": c.created_at_utc.isoformat(),
+                "likes": c.like_count or 0,
+                "reply": bool(c.replied_to_comment_id),
+            }
+            for c in items
+        ],
+        "next": nxt or None,
+    }
+
+
+class Save(BaseModel):
+    media_id: str
+    save: bool
+
+
+@app.post("/api/p/{media_pk}/save")
+def save(media_pk: str, body: Save):
+    ig.run(lambda cl: cl.media_save(body.media_id, revert=not body.save), kind="like")
+    ig.forget(f"media:{media_pk}")
+    return {"saved": body.save}
+
+
+class Share(BaseModel):
+    media_id: str
+    video: bool = False
+    thread_id: str | None = None
+    user_id: str | None = None
+
+
+@app.post("/api/p/{media_pk}/share")
+def share(media_pk: str, body: Share):
+    kind = "video" if body.video else "photo"
+    if body.thread_id:
+        ig.run(lambda cl: cl.direct_media_share(body.media_id, thread_ids=[int(body.thread_id)], media_type=kind), kind="dm")
+    else:
+        ig.run(lambda cl: cl.direct_media_share(body.media_id, user_ids=[int(body.user_id)], media_type=kind), kind="dm_new")
+    ig.forget("inbox:")
+    return {"ok": True}
+
+
 class Like(BaseModel):
     media_id: str
     like: bool
@@ -706,6 +788,26 @@ def thread(thread_id: str, n: int = 20):  # Instagram pages messages by 20
         ig.run(lambda cl: cl.direct_send_seen(int(thread_id)), kind="seen")
         ig.forget("inbox:")
     return {**thread_json(t, my_id), "messages": [message_json(m, my_id) for m in messages], "n": n}
+
+
+class React(BaseModel):
+    message_id: str
+    emoji: str = "❤️"
+    remove: bool = False
+    context: str | None = None
+
+
+@app.post("/api/dm/{thread_id}/react")
+def react(thread_id: str, body: React):
+    if body.remove:
+        ig.run(lambda cl: cl.direct_delete_reaction(int(thread_id), int(body.message_id), body.emoji, client_context=body.context), kind="dm")
+    else:
+        ig.run(
+            lambda cl: cl.direct_send_reaction(int(thread_id), int(body.message_id), body.emoji, client_context=body.context),
+            kind="dm",
+        )
+    ig.forget(f"thread:{thread_id}:")
+    return {"ok": True}
 
 
 class Send(BaseModel):

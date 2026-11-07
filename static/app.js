@@ -212,6 +212,8 @@ const I = {
   heart: html`<svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-9.3-9.2C1.4 7.4 3.6 4 7.1 4c2 0 3.4 1.1 4.9 3 1.5-1.9 2.9-3 4.9-3 3.5 0 5.7 3.4 4.4 6.8C19.5 15.4 12 20 12 20z"/></svg>`,
   gear: html`<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`,
   x: html`<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>`,
+  comment: html`<svg viewBox="0 0 24 24"><path d="M20.7 16.4A9 9 0 1 0 17 20l4 1z"/></svg>`,
+  bookmark: html`<svg viewBox="0 0 24 24"><path d="M19 21 12 16 5 21V4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1z"/></svg>`,
   sun: html`<svg viewBox="0 0 24 24"><path d="M3 18h18M6.5 18a5.5 5.5 0 0 1 11 0"/><path d="M12 7V4M5.2 10.2 3.6 8.6M18.8 10.2l1.6-1.6"/></svg>`,
   lock: html`<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>`,
   camera: html`<svg viewBox="0 0 24 24"><rect x="3.96" y="3.96" width="16.08" height="16.08" rx="4.32"/><circle cx="12" cy="12" r="3.7"/><circle cx="16.51" cy="7.44" r="1.03" class="dot"/></svg>`,
@@ -220,14 +222,20 @@ const I = {
   check: html`<svg viewBox="0 0 24 24" class="verified"><circle cx="12" cy="12" r="10"/><path d="m8 12.5 2.6 2.5L16 9.5"/></svg>`,
 };
 
+// Some Instagram images are marked "show only on instagram.com", which Safari
+// enforces; when one fails, fetch it through our server instead.
+const viaServer = (u) => (u && /^https:\/\/[^/]+\.(cdninstagram\.com|fbcdn\.net)\//.test(u) ? `/api/img?u=${encodeURIComponent(u)}` : null);
+
 function Img({ src, fallback, class: cls = "", alt = "", ...rest }) {
   const [ok, setOk] = useState(false);
-  const [failed, setFailed] = useState(null);
-  if (failed === src && fallback) src = fallback;
+  const [fail, setFail] = useState({ src, n: 0 });
+  const n = fail.src === src ? fail.n : 0;
+  const tries = [...new Set([src, viaServer(src), fallback, viaServer(fallback)].filter(Boolean))];
+  src = tries[Math.min(n, tries.length - 1)];
   return src
     ? html`<img
         src=${src}
-        onError=${() => fallback && failed !== src && setFailed(src)}
+        onError=${() => n < tries.length - 1 && setFail({ src: tries[0], n: n + 1 })}
         alt=${alt}
         class=${`${cls} ${ok ? "loaded" : ""}`}
         decoding="async"
@@ -272,9 +280,9 @@ function ErrorView({ error, retry }) {
   </div>`;
 }
 
-function Sheet({ children, onClose }) {
+function Sheet({ children, onClose, tall = false }) {
   return html`<div class="sheet-backdrop" onClick=${onClose}>
-    <div class="sheet" onClick=${(e) => e.stopPropagation()}>${children}</div>
+    <div class=${`sheet ${tall ? "tall" : ""}`} onClick=${(e) => e.stopPropagation()}>${children}</div>
   </div>`;
 }
 
@@ -576,8 +584,14 @@ function Profile({ username }) {
     ${sheet &&
     html`<${Sheet} onClose=${() => setSheet(false)}>
       <${Avatar} src=${u.pic} size=${64} />
-      <p>${p.rel.requested ? "Cancel your follow request to" : "Unfollow"} <b>@${u.username}</b>?</p>
-      ${p.private && !p.rel.requested && html`<p class="muted small">You'll need to request again to see their posts.</p>`}
+      <p><b>@${u.username}</b></p>
+      ${p.rel.following &&
+      html`<div class="toggles">
+          <label class="toggle-row"><span>Mute posts</span><input type="checkbox" class="switch" checked=${p.rel.muted_posts} onChange=${(e) => mute(p, key, { posts: e.target.checked })} /></label>
+          <label class="toggle-row"><span>Mute stories</span><input type="checkbox" class="switch" checked=${p.rel.muted_stories} onChange=${(e) => mute(p, key, { stories: e.target.checked })} /></label>
+        </div>
+        <p class="muted small">They won't know. Muted posts and stories stay out of Today.</p>`}
+      ${p.private && !p.rel.requested && html`<p class="muted small">If you unfollow, you'll need to request again to see their posts.</p>`}
       <button class="btn danger" onClick=${() => (setSheet(false), follow(p, key, false))}>${p.rel.requested ? "Cancel request" : "Unfollow"}</button>
       <button class="btn secondary" onClick=${() => setSheet(false)}>Cancel</button>
     <//>`}
@@ -658,6 +672,20 @@ function Highlights({ userId, username }) {
       <//>`
     )}
   </div>`;
+}
+
+async function mute(p, key, what) {
+  const before = store.get(key)?.data;
+  const rel = { ...p.rel };
+  if ("posts" in what) rel.muted_posts = what.posts;
+  if ("stories" in what) rel.muted_stories = what.stories;
+  setData(key, { ...before, rel });
+  try {
+    await api(`/api/u/${p.id}/mute`, { method: "POST", body: what });
+  } catch (e) {
+    setData(key, before);
+    toast(e.message);
+  }
 }
 
 async function follow(p, key, on) {
@@ -768,7 +796,20 @@ function Post({ id }) {
 function PostCard({ m, onChange, showTime = false }) {
   const [idx, setIdx] = useState(0);
   const [burst, setBurst] = useState(0);
+  const [panel, setPanel] = useState(null); // "comments" | "share"
   const lastTap = useRef(0);
+
+  const save = async (on) => {
+    const before = m;
+    onChange({ ...m, saved: on });
+    try {
+      await api(`/api/p/${m.id}/save`, { method: "POST", body: { media_id: m.media_id, save: on } });
+      toast(on ? "Saved" : "Removed from saved");
+    } catch (e) {
+      onChange(before);
+      toast(e.message);
+    }
+  };
 
   const like = async (on) => {
     const before = m;
@@ -810,13 +851,87 @@ function PostCard({ m, onChange, showTime = false }) {
       ${burst > 0 && html`<span class="burst" key=${burst}>${I.heart}</span>`}
     </div>
     ${m.items.length > 1 && html`<div class="dots">${m.items.map((_, i) => html`<i class=${i === idx ? "on" : ""}></i>`)}</div>`}
-    <div class="post-meta">
+    <div class="post-actions">
       <button class=${`icon like ${m.liked ? "on" : ""}`} onClick=${() => like(!m.liked)}>${I.heart}</button>
+      <button class="icon" onClick=${() => setPanel("comments")}>${I.comment}</button>
+      <button class="icon" onClick=${() => setPanel("share")}>${I.send}</button>
+      <button class=${`icon save ${m.saved ? "on" : ""}`} onClick=${() => save(!m.saved)}>${I.bookmark}</button>
+    </div>
+    <div class="post-meta">
       ${m.likes != null && html`<b>${count(m.likes)} ${m.likes === 1 ? "like" : "likes"}</b>`}
       ${m.caption && html`<p class="caption"><b>${m.user.username}</b> ${m.caption}</p>`}
+      ${m.comments > 0 && html`<button class="link-muted" onClick=${() => setPanel("comments")}>View all ${count(m.comments)} comments</button>`}
       ${!showTime && html`<small class="muted">${new Date(m.taken_at).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}</small>`}
     </div>
+    ${panel === "comments" && html`<${Comments} m=${m} onClose=${() => setPanel(null)} />`}
+    ${panel === "share" && html`<${ShareSheet} m=${m} onClose=${() => setPanel(null)} />`}
   </article>`;
+}
+
+function Comments({ m, onClose }) {
+  const [cursors, setCursors] = useState([""]);
+  return html`<${Sheet} onClose=${onClose} tall=${true}>
+    <div class="sheet-head"><b>Comments</b></div>
+    <div class="sheet-scroll">
+      ${cursors.map(
+        (c, i) => html`<${CommentPage} key=${c} m=${m} cursor=${c} last=${i === cursors.length - 1} more=${(n) => setCursors([...cursors, n])} />`
+      )}
+    </div>
+  <//>`;
+}
+
+function CommentPage({ m, cursor, last, more }) {
+  const { data, error } = useQuery(`/api/p/${m.id}/comments?media_id=${encodeURIComponent(m.media_id)}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`, 120000);
+  if (!data) return error ? html`<p class="muted small pad">${error.message}</p>` : cursor ? null : html`<${Spinner} />`;
+  if (!cursor && !data.items.length) return html`<p class="muted center-text pad">No comments yet.</p>`;
+  return html`${data.items.map(
+    (c) => html`<div class=${`comment ${c.reply ? "reply" : ""}`} key=${c.id}>
+      <${Link} href=${`/u/${encodeURIComponent(c.user.username)}`} warm=${() => warmUser(c.user)}><${Avatar} src=${c.user.pic} size=${32} /><//>
+      <div>
+        <p><b>${c.user.username}</b> ${c.text}</p>
+        <small class="muted">${ago(c.t)}${c.likes ? ` · ${count(c.likes)} like${c.likes === 1 ? "" : "s"}` : ""}</small>
+      </div>
+    </div>`
+  )}
+  ${last && data.next && html`<button class="btn ghost more wide" onClick=${() => more(data.next)}>More comments</button>`}`;
+}
+
+function ShareSheet({ m, onClose }) {
+  const [q, setQ] = useState("");
+  const [term, setTerm] = useState("");
+  const [sent, setSent] = useState({});
+  useEffect(() => {
+    const t = setTimeout(() => setTerm(q.trim()), 250);
+    return () => clearTimeout(t);
+  }, [q]);
+  const threads = useQuery("/api/dm", 60000).data || [];
+  const found = useQuery(term ? `/api/search?q=${encodeURIComponent(term.toLowerCase())}` : null, 5 * 60000).data || [];
+  const video = m.items.length === 1 && m.items[0].type === 2;
+  const send = async (target, body) => {
+    setSent((x) => ({ ...x, [target]: "sending" }));
+    try {
+      await api(`/api/p/${m.id}/share`, { method: "POST", body: { media_id: m.media_id, video, ...body } });
+      setSent((x) => ({ ...x, [target]: "sent" }));
+    } catch (e) {
+      setSent((x) => ({ ...x, [target]: null }));
+      toast(e.message);
+    }
+  };
+  const row = (key, pic, title, sub, body) => html`<li class="row" key=${key}>
+    <span class="row-main"><${Avatar} src=${pic} /><span class="row-text"><b>${title}</b>${sub && html`<small class="muted">${sub}</small>`}</span></span>
+    <button class=${`btn small ${sent[key] ? "secondary" : ""}`} disabled=${!!sent[key]} onClick=${() => send(key, body)}>
+      ${sent[key] === "sent" ? "Sent" : sent[key] ? "…" : "Send"}
+    </button>
+  </li>`;
+  return html`<${Sheet} onClose=${onClose} tall=${true}>
+    <div class="sheet-head"><b>Send to</b></div>
+    <div class="field sheet-search">${I.search}<input type="search" placeholder="Search" value=${q} autocapitalize="off" autocorrect="off" onInput=${(e) => setQ(e.target.value)} /></div>
+    <ul class="list sheet-scroll">
+      ${term
+        ? found.map((u) => row(`u${u.id}`, u.pic, u.username, u.name, { user_id: u.id }))
+        : threads.map((t) => row(`t${t.id}`, t.users[0]?.pic, t.title, t.group ? `${t.users.length} people` : null, { thread_id: t.id }))}
+    </ul>
+  <//>`;
 }
 
 function CodeRedirect({ code }) {
@@ -1164,7 +1279,45 @@ function Bubble({ m }) {
   </div>`;
 }
 
-function Messages({ messages, users, group }) {
+const REACTIONS = ["❤️", "😂", "😮", "😢", "😡", "👍"];
+
+/* Double-tap a message to ❤️ it; press and hold to pick another reaction. */
+function Reactable({ m, onReact, children }) {
+  const [picker, setPicker] = useState(false);
+  const press = useRef(null);
+  const lastTap = useRef(0);
+  const canReact = onReact && !String(m.id).startsWith("local-");
+  const down = () => {
+    if (!canReact) return;
+    press.current = setTimeout(() => ((press.current = null), setPicker(true), navigator.vibrate?.(10)), 450);
+  };
+  const up = () => {
+    if (!press.current) return;
+    clearTimeout(press.current);
+    press.current = null;
+    const now = Date.now();
+    if (now - lastTap.current < 300) onReact(m, "❤️");
+    lastTap.current = now;
+  };
+  const cancel = () => press.current && (clearTimeout(press.current), (press.current = null));
+  const counts = {};
+  (m.reactions || []).forEach((r) => (counts[r.emoji] = (counts[r.emoji] || 0) + 1));
+  const mine = (m.reactions || []).find((r) => r.mine)?.emoji;
+  return html`<div class="reactable" onPointerDown=${down} onPointerUp=${up} onPointerLeave=${cancel} onPointerCancel=${cancel} onContextMenu=${(e) => e.preventDefault()}>
+    ${children}
+    ${Object.keys(counts).length > 0 &&
+    html`<div class="reactions">${Object.entries(counts).map(([e, n]) => html`<span>${e}${n > 1 ? n : ""}</span>`)}</div>`}
+    ${picker &&
+    html`<div class="react-cover" onPointerDown=${(e) => (e.stopPropagation(), setPicker(false))}></div>
+      <div class="react-bar">
+        ${REACTIONS.map(
+          (e) => html`<button class=${mine === e ? "on" : ""} onPointerDown=${(ev) => ev.stopPropagation()} onClick=${() => (setPicker(false), onReact(m, e))}>${e}</button>`
+        )}
+      </div>`}
+  </div>`;
+}
+
+function Messages({ messages, users, group, onReact }) {
   const names = Object.fromEntries(users.map((u) => [u.id, u.username]));
   let prevT = 0;
   let prevUser = null;
@@ -1178,7 +1331,7 @@ function Messages({ messages, users, group }) {
       ${gap && html`<div class="when">${new Date(m.t).toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" })}</div>`}
       <div class=${`msg ${m.mine ? "mine" : ""} ${m.sending ? "sending" : ""} ${m.failed ? "failed" : ""}`} key=${m.id}>
         ${showName && html`<small class="muted">${names[m.user_id] || ""}</small>`}
-        <${Bubble} m=${m} />
+        <${Reactable} m=${m} onReact=${onReact}><${Bubble} m=${m} /><//>
         ${m.failed && html`<small class="error">Not sent</small>`}
       </div>
     `;
@@ -1258,6 +1411,22 @@ function Thread({ id }) {
     }
   };
 
+  const react = async (m, emoji) => {
+    active.current = Date.now();
+    const before = store.get(key)?.data;
+    if (!before) return;
+    const mine = (m.reactions || []).find((r) => r.mine);
+    const remove = mine?.emoji === emoji;
+    const reactions = (m.reactions || []).filter((r) => !r.mine).concat(remove ? [] : [{ emoji, mine: true }]);
+    setData(key, { ...before, messages: before.messages.map((x) => (x.id === m.id ? { ...x, reactions } : x)) });
+    try {
+      await api(`/api/dm/${id}/react`, { method: "POST", body: { message_id: m.id, emoji, remove, context: m.context } });
+    } catch (e) {
+      setData(key, before);
+      toast(e.message);
+    }
+  };
+
   const t = data || peek;
   const one = t && !t.group && t.users.length === 1 ? t.users[0] : null;
   return html`<div class="page thread" ref=${list}>
@@ -1273,7 +1442,7 @@ function Thread({ id }) {
     ${!data && !error && html`<${Spinner} />`}
     <div class="messages">
       ${data && data.messages.length >= n && n < 200 && html`<button class="link small older" onClick=${() => ((stick.current = false), setN(n + 20))}>Load older</button>`}
-      ${data && html`<${Messages} messages=${msgs} users=${data.users} group=${data.group} />`}
+      ${data && html`<${Messages} messages=${msgs} users=${data.users} group=${data.group} onReact=${react} />`}
     </div>
     <div class="composer-wrap" onClick=${() => (active.current = Date.now())}>
       <${Composer} onSend=${(text) => send(text)} />
