@@ -1574,9 +1574,6 @@ img.loaded,
   font-weight: 700;
   padding: 0 6px;
 }
-.sentinel {
-  height: 1px;
-}
 
 /* ---- profile sections ------------------------------------------------------- */
 
@@ -1597,11 +1594,16 @@ img.loaded,
   display: flex;
   border-top: 0.5px solid var(--line);
 }
-.grid-tabs span {
+.grid-tabs span,
+.grid-tabs button {
   flex: 1;
   display: grid;
   place-items: center;
   height: 44px;
+  color: var(--fg-2);
+  transition: color 0.15s, box-shadow 0.15s;
+}
+.grid-tabs .on {
   color: var(--fg);
   box-shadow: inset 0 -1px 0 var(--fg);
 }
@@ -1634,4 +1636,14 @@ img.loaded,
 .new-tile small {
   font-size: 12px;
   font-weight: 600;
+}
+
+.gathering {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 0 40px;
+}
+.gathering .spinner {
+  margin: 16px auto 12px;
 }

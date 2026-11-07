@@ -35,6 +35,7 @@ from instagrapi.exceptions import (
     RateLimitError,
 )
 import requests
+from instagrapi import config as ig_config
 from instagrapi.extractors import extract_media_v1, extract_user_v1
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
@@ -679,26 +680,79 @@ def daily_page(day: str, cursor: str):
     return items, more or None, tally
 
 
+POOL_FILE = DATA / "daily_pool.json"
+SCAN_MAX_PAGES = 8
+
+
+def pool_update(media_pk: str, **fields):
+    """Keep likes/saves made from Today in the stored copy."""
+    pool = read_json(POOL_FILE)
+    if media_pk in pool:
+        pool[media_pk]["m"].update(fields)
+        write_private_json(POOL_FILE, pool)
+
+
 @app.get("/api/daily/feed")
-def daily_feed(cursor: str = ""):
-    """A batch of posts: keeps reading pages until there's enough to scroll through."""
+def daily_feed():
+    """Everything Instagram's feed has from people you follow, newest first.
+
+    Instagram's own chronological "Following" feed isn't reachable here, and its
+    regular feed drifts into suggestions and repeats after a page or two. So read
+    pages until nothing new turns up, and remember posts for a week so they don't
+    vanish between visits.
+    """
     require_daily_open()
     day = local_now().date().isoformat()
-    target = 8 if cursor else 4  # small first batch so the tab opens fast
-    items, seen, tally, pages = [], set(), Counter(), 0
-    while pages < 4:
+    found, tally, cursor, pages, dry = {}, Counter(), "", 0, 0
+    while pages < SCAN_MAX_PAGES:
         page, cursor, t = daily_page(day, cursor)
         pages += 1
         tally.update(t)
+        new = [m for m in page if m["id"] not in found]
         for m in page:
-            if m["id"] not in seen:
-                seen.add(m["id"])
-                items.append(m)
-        if not cursor or len(items) >= target:
+            found[m["id"]] = m
+        dry = 0 if new else dry + 1
+        if not cursor or dry >= 2:
             break
-    # Counts only, no content: lets us tune the filter from the logs.
-    log.info("daily feed pages=%d shown=%d %s", pages, len(items), dict(tally))
-    return {"items": items, "next": cursor}
+
+    now = dt.datetime.now(dt.timezone.utc)
+    cutoff = now - DAILY_MAX_AGE
+    pool = {k: v for k, v in read_json(POOL_FILE).items() if dt.datetime.fromisoformat(v["m"]["taken_at"]) >= cutoff}
+    for pk, m in found.items():
+        first = pool.get(pk, {}).get("first_seen", now.isoformat())
+        pool[pk] = {"m": m, "first_seen": first}
+    write_private_json(POOL_FILE, pool)
+
+    items = sorted((v["m"] for v in pool.values()), key=lambda m: m["taken_at"], reverse=True)
+    # Counts only, no content: lets us tune this from the logs.
+    log.info("daily feed pages=%d found=%d pool=%d %s", pages, len(found), len(items), dict(tally))
+    return {"items": items}
+
+
+def reels_media(cl, user_ids):
+    """Several people's stories in one private request (as highlight_info_v1 does)."""
+    data = {
+        "exclude_media_ids": "[]",
+        "supported_capabilities_new": json.dumps(ig_config.SUPPORTED_CAPABILITIES),
+        "source": "reel_feed_timeline",
+        "_uid": str(cl.user_id),
+        "_uuid": cl.uuid,
+        "user_ids": [str(i) for i in user_ids],
+    }
+    return list((cl.private_request("feed/reels_media/", data).get("reels") or {}).values())
+
+
+def tray_entry(reel):
+    u = reel.get("user") or {}
+    fs = u.get("friendship_status") or {}
+    if reel.get("reel_type", "user_reel") != "user_reel" or fs.get("following") is False or not u.get("username"):
+        return None
+    if reel.get("muted") or fs.get("is_muting_reel"):  # stories you've muted
+        return None
+    if str(u.get("pk") or u.get("pk_id")) == ig.user_id:
+        return None
+    unseen = (reel.get("seen") or 0) < (reel.get("latest_reel_media") or 0)
+    return {**raw_user(u), "unseen": unseen}
 
 
 @app.get("/api/daily/stories")
@@ -706,20 +760,37 @@ def daily_stories():
     require_daily_open()
     day = local_now().date().isoformat()
     raw = ig.cached(f"daily:tray:{day}", 600, lambda cl: cl.get_reels_tray_feed("cold_start"))
-    out = []
-    for reel in raw.get("tray") or []:
-        u = reel.get("user") or {}
-        fs = u.get("friendship_status") or {}
-        if reel.get("reel_type", "user_reel") != "user_reel" or fs.get("following") is False or not u.get("username"):
-            continue
-        if reel.get("muted") or fs.get("is_muting_reel"):  # stories you've muted
-            continue
-        if str(u.get("pk") or u.get("pk_id")) == ig.user_id:
-            continue
-        unseen = (reel.get("seen") or 0) < (reel.get("latest_reel_media") or 0)
-        out.append({**raw_user(u), "unseen": unseen})
+    reels = list(raw.get("tray") or [])
+    # The tray's first page is new stories only; the people you've already
+    # watched come as bare ids. Fetch up to 100 of them so you can rewatch.
+    rest = [r for r in raw.get("remaining_reel_ids_to_fetch") or [] if str(r).isdigit()][:100]
+    for i in range(0, len(rest), 50):
+        chunk = rest[i : i + 50]
+        reels += ig.cached(f"daily:reels:{day}:{i}", 600, reels_media, chunk, soft=True)
+    out, seen_ids = [], set()
+    for reel in reels:
+        e = tray_entry(reel)
+        if e and e["id"] not in seen_ids:
+            seen_ids.add(e["id"])
+            out.append(e)
     out.sort(key=lambda x: not x["unseen"])  # new ones first, like the real app
+    log.info("daily tray first=%d rest=%d shown=%d unseen=%d", len(raw.get("tray") or []), len(rest), len(out), sum(x["unseen"] for x in out))
     return out
+
+
+# -- your saved and liked posts --------------------------------------------------
+
+
+@app.get("/api/me/{which}")
+def my_collection(which: str, cursor: str = ""):
+    if which not in ("saved", "liked"):
+        return err(404, "not_found", "No such list.")
+    medias, nxt = ig.cached(
+        f"mine:{which}:{cursor}",
+        120,
+        lambda cl: cl.collection_medias_v1_chunk("liked" if which == "liked" else "saved", max_id=cursor),
+    )
+    return {"items": [media_tile(m) for m in medias], "next": nxt or None}
 
 
 # -- follow requests -----------------------------------------------------------
@@ -806,7 +877,8 @@ class Save(BaseModel):
 @app.post("/api/p/{media_pk}/save")
 def save(media_pk: str, body: Save):
     ig.run(lambda cl: cl.media_save(body.media_id, revert=not body.save), kind="like")
-    ig.forget(f"media:{media_pk}")
+    ig.forget(f"media:{media_pk}", "mine:saved")
+    pool_update(media_pk, saved=body.save)
     return {"saved": body.save}
 
 
@@ -836,7 +908,8 @@ class Like(BaseModel):
 @app.post("/api/p/{media_pk}/like")
 def like(media_pk: str, body: Like):
     ig.run(lambda cl: cl.media_like(body.media_id, revert=not body.like), kind="like")
-    ig.forget(f"media:{media_pk}")
+    ig.forget(f"media:{media_pk}", "mine:liked")
+    pool_update(media_pk, liked=body.like)
     return {"liked": body.like}
 
 

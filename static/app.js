@@ -536,6 +536,7 @@ function Profile({ username }) {
     if (hasStories) new Image().src = stories[0].img; // so tapping the ring opens instantly
   }, [hasStories && stories[0].id]);
   const [sheet, setSheet] = useState(false);
+  const [myTab, setMyTab] = useState(profileTab.value);
   const ptr = usePullToRefresh(
     useCallback(async () => {
       dropData(`/api/u/${id}/posts`);
@@ -576,8 +577,20 @@ function Profile({ username }) {
     ${p && !p.me && html`<${ProfileActions} p=${p} k=${key} onUnfollow=${() => setSheet(true)} />`}
     ${!p && html`<div class="actions"><button class="btn ghost" disabled>…</button></div>`}
     ${id && (p?.can_see ?? !u.private) && html`<${Highlights} userId=${id} username=${u.username} />`}
-    <div class="grid-tabs"><span>${I.grid}</span></div>
-    ${p && !p.can_see
+    ${p?.me
+      ? html`<div class="grid-tabs">
+          ${[
+            ["posts", I.grid, "Posts"],
+            ["saved", I.bookmark, "Saved"],
+            ["liked", I.heart, "Liked"],
+          ].map(
+            ([k, icon, label]) => html`<button class=${myTab === k ? "on" : ""} aria-label=${label} onClick=${() => ((profileTab.value = k), setMyTab(k))}>${icon}</button>`
+          )}
+        </div>`
+      : html`<div class="grid-tabs"><span class="on">${I.grid}</span></div>`}
+    ${p?.me && myTab !== "posts"
+      ? html`<${Collection} key=${myTab} which=${myTab} />`
+      : p && !p.can_see
       ? html`<${Empty}><div class="big-icon">${I.lock}</div><b>This account is private</b><p class="muted">Follow to see their photos.</p><//>`
       : p && p.posts === 0 && !p.me
       ? html`<${Empty}><p class="muted">No posts yet.</p><//>`
@@ -727,6 +740,29 @@ function ProfileActions({ p, k, onUnfollow }) {
       : html`<button class="btn" onClick=${() => follow(p, k, true)}>${r.followed_by ? "Follow back" : "Follow"}</button>`}
     <button class="btn secondary" onClick=${openChat}>Message</button>
   </div>`;
+}
+
+const profileTab = { value: "posts" }; // remembered while the app is open
+
+function Collection({ which }) {
+  const [cursors, setCursors] = useState([""]);
+  return html`<div class="grid">
+    ${cursors.map(
+      (c, i) => html`<${CollectionPage} key=${c} which=${which} cursor=${c} last=${i === cursors.length - 1} more=${(n) => setCursors([...cursors, n])} />`
+    )}
+  </div>`;
+}
+
+function CollectionPage({ which, cursor, last, more }) {
+  const { data, error, refresh } = useQuery(`/api/me/${which}${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`, 60000);
+  if (!data) {
+    if (error) return html`<div class="grid-wide"><${ErrorView} error=${error} retry=${refresh} /></div>`;
+    return Array.from({ length: cursor ? 3 : 9 }, () => html`<span class="tile skeleton"></span>`);
+  }
+  if (!cursor && !data.items.length)
+    return html`<div class="grid-wide"><${Empty}><p class="muted">${which === "saved" ? "Nothing saved yet." : "No liked posts yet."}</p><//></div>`;
+  return html`${data.items.map((m) => html`<${Tile} key=${m.id} m=${m} />`)}
+  ${last && data.next && html`<button class="grid-wide btn ghost more" onClick=${() => more(data.next)}>Show more</button>`}`;
 }
 
 function Grid({ userId, mine = false, empty = false }) {
@@ -1142,12 +1178,8 @@ function Today() {
   const [deadline, setDeadline] = useState(null);
   const [stories, setStories] = useState(null);
   const [posts, setPosts] = useState(null);
-  const [next, setNext] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [nearEnd, setNearEnd] = useState(false);
   const [viewer, setViewer] = useState(null);
   const [error, setError] = useState(null);
-  const sentinel = useRef();
 
   const apply = (x) => {
     setSt(x);
@@ -1167,37 +1199,14 @@ function Today() {
     api("/api/daily").then(apply).catch(setError);
   }, []);
 
-  const load = (cursor) => {
-    setLoading(true);
-    return api(`/api/daily/feed${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`)
-      .then((r) => {
-        setPosts((p) => {
-          const have = new Set((p || []).map((x) => x.id));
-          return [...(p || []), ...r.items.filter((m) => !have.has(m.id))];
-        });
-        setNext(r.next);
-      })
-      .catch(fail)
-      .finally(() => setLoading(false));
-  };
-
+  // One list, newest first, that ends: the server gathers it all up front.
   useEffect(() => {
     if (st?.status !== "open") return;
     api("/api/daily/stories").then(setStories).catch(() => setStories([]));
-    load(null);
+    api("/api/daily/feed")
+      .then((r) => setPosts(r.items))
+      .catch(fail);
   }, [st?.status]);
-
-  // Keep a batch ahead: start loading well before you reach the bottom.
-  useEffect(() => {
-    const el = sentinel.current;
-    if (!el) return;
-    const io = new IntersectionObserver(([e]) => setNearEnd(e.isIntersecting), { rootMargin: "2500px 0px" });
-    io.observe(el);
-    return () => io.disconnect();
-  }, [posts !== null]);
-  useEffect(() => {
-    if (nearEnd && next && !loading) load(next);
-  }, [nearEnd, next, loading]);
 
   const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
   const update = useCallback((nm) => setPosts((p) => p.map((x) => (x.id === nm.id ? nm : x))), []);
@@ -1240,14 +1249,11 @@ function Today() {
       )}
     </div>`}
     ${posts === null
-      ? html`<${Spinner} />`
-      : !posts.length && !next && !loading
+      ? html`<div class="gathering"><${Spinner} /><small class="muted">Gathering posts from people you follow…</small></div>`
+      : !posts.length
       ? html`<${Empty}><p class="muted">Nothing new from people you follow.</p><//>`
-      : posts.map((m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`)}
-    <div ref=${sentinel} class="sentinel"></div>
-    ${posts !== null && (next || loading)
-      ? html`<${Spinner} />`
-      : posts?.length > 0 && html`<p class="caught-up muted">${I.check} You're all caught up</p>`}
+      : html`${posts.map((m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`)}
+          <p class="caught-up muted">${I.check} You're all caught up</p>`}
     ${viewer &&
     html`<${Stories}
       key=${viewer.id}
