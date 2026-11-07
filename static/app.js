@@ -562,6 +562,7 @@ function Profile({ username }) {
     </section>
     ${p && !p.me && html`<${ProfileActions} p=${p} k=${key} onUnfollow=${() => setSheet(true)} />`}
     ${!p && html`<div class="actions"><button class="btn ghost" disabled>…</button></div>`}
+    ${id && (p?.can_see ?? !u.private) && html`<${Highlights} userId=${id} username=${u.username} />`}
     ${p && !p.can_see
       ? html`<${Empty}><div class="big-icon">${I.lock}</div><b>This account is private</b><p class="muted">Follow to see their photos.</p><//>`
       : p && p.posts === 0
@@ -577,6 +578,24 @@ function Profile({ username }) {
       <button class="btn danger" onClick=${() => (setSheet(false), follow(p, key, false))}>${p.rel.requested ? "Cancel request" : "Unfollow"}</button>
       <button class="btn secondary" onClick=${() => setSheet(false)}>Cancel</button>
     <//>`}
+  </div>`;
+}
+
+function Highlights({ userId, username }) {
+  const { data } = useQuery(`/api/u/${userId}/highlights`, 10 * 60000);
+  if (!data?.length) return null;
+  return html`<div class="highlights">
+    ${data.map(
+      (h) => html`<${Link}
+        key=${h.id}
+        href=${`/u/${encodeURIComponent(username)}/highlights/${h.id}`}
+        class="highlight"
+        warm=${() => prefetch(`/api/highlight/${h.id}`, 10 * 60000)}
+      >
+        <${Avatar} src=${h.cover} size=${64} />
+        <span>${h.title}</span>
+      <//>`
+    )}
   </div>`;
 }
 
@@ -728,10 +747,13 @@ function CodeRedirect({ code }) {
    Stories: one person at a time. When theirs end, you're back on their profile.
    ========================================================================== */
 
-function Stories({ username }) {
+function Stories({ username, highlight }) {
   const prof = useQuery(`/api/u/${encodeURIComponent(username)}`, 60000).data || peeks.users.get(username.toLowerCase());
   const id = prof?.id;
-  const { data: items, error } = useQuery(id ? `/api/u/${id}/stories` : null, 60000);
+  const key = highlight ? `/api/highlight/${highlight}` : id ? `/api/u/${id}/stories` : null;
+  const q = useQuery(key, highlight ? 10 * 60000 : 60000);
+  const items = highlight ? q.data?.items : q.data;
+  const error = q.error;
   const [i, setI] = useState(0);
   const [paused, setPaused] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -743,7 +765,7 @@ function Stories({ username }) {
   const cur = items?.[i];
 
   const close = () => {
-    if (seen.current.size) api("/api/stories/seen", { method: "POST", body: { ids: [...seen.current] } }).catch(() => {});
+    if (!highlight && seen.current.size) api("/api/stories/seen", { method: "POST", body: { ids: [...seen.current] } }).catch(() => {});
     back(`/u/${encodeURIComponent(username)}`);
   };
   const next = () => (items && i < items.length - 1 ? setI(i + 1) : close());
@@ -815,7 +837,7 @@ function Stories({ username }) {
           <div class="bars">${items.map((_, j) => html`<i><b style=${`width:${j < i ? 100 : j > i ? 0 : progress * 100}%`}></b></i>`)}</div>
           <div class="story-head">
             <${Avatar} src=${prof?.pic} size=${32} />
-            <b>${username}</b><span>${ago(cur.taken_at)}</span>
+            <b>${highlight ? q.data?.title || username : username}</b><span>${highlight ? username : ago(cur.taken_at)}</span>
             <button class="icon" onClick=${close}>${I.x}</button>
           </div>
           <div class="story-media" onPointerDown=${onDown} onPointerMove=${onMove} onPointerUp=${onUp} onPointerCancel=${onUp}>
@@ -1172,6 +1194,8 @@ function route(path, search, status, refreshStatus) {
   const d = decodeURIComponent;
   if (path === "/") return { tab: "search", el: html`<${Search} initial=${new URLSearchParams(search).get("q") || ""} />` };
   if ((m = path.match(/^\/u\/([^/]+)\/stories$/))) return { bare: true, el: html`<${Stories} username=${d(m[1])} />` };
+  if ((m = path.match(/^\/u\/([^/]+)\/highlights\/(\d+)$/)))
+    return { bare: true, el: html`<${Stories} key=${m[2]} username=${d(m[1])} highlight=${m[2]} />` };
   if ((m = path.match(/^\/u\/([^/]+)$/))) return { tab: d(m[1]) === me.username ? "me" : "search", el: html`<${Profile} username=${d(m[1])} />` };
   if ((m = path.match(/^\/p\/(\d+)$/))) return { tab: "search", el: html`<${Post} id=${m[1]} />` };
   if ((m = path.match(/^\/c\/([\w-]+)$/))) return { tab: "dm", el: html`<${CodeRedirect} code=${m[1]} />` };

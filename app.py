@@ -420,6 +420,24 @@ def stories(user_id: str):
     return [story_json(st) for st in sorted(items, key=lambda st: st.taken_at)]
 
 
+def highlight_cover(h):
+    c = h.cover_media or {}
+    url = (c.get("cropped_image_version") or {}).get("url") or (c.get("full_image_version") or {}).get("url")
+    return url
+
+
+@app.get("/api/u/{user_id}/highlights")
+def highlights(user_id: str):
+    items = ig.cached(f"highlights:{user_id}", 600, lambda cl: cl.user_highlights_v1(user_id), soft=True)
+    return [{"id": h.pk, "title": h.title, "cover": highlight_cover(h)} for h in items]
+
+
+@app.get("/api/highlight/{highlight_id}")
+def highlight(highlight_id: str):
+    h = ig.cached(f"highlight:{highlight_id}", 600, lambda cl: cl.highlight_info_v1(highlight_id), soft=True)
+    return {"id": h.pk, "title": h.title, "items": [story_json(st) for st in h.items]}
+
+
 class Ids(BaseModel):
     ids: list[str]
 

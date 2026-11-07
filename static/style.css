@@ -558,6 +558,40 @@ img.loaded,
   flex: 1;
 }
 
+.highlights {
+  display: flex;
+  gap: 14px;
+  padding: 0 16px 16px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.highlights::-webkit-scrollbar {
+  display: none;
+}
+.highlight {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  width: 68px;
+  flex: none;
+}
+.highlight .avatar {
+  padding: 2px;
+  background: var(--bg);
+  box-shadow: 0 0 0 1px var(--line);
+}
+.highlight span {
+  max-width: 100%;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.highlight:active {
+  opacity: 0.6;
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
