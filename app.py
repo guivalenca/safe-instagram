@@ -8,6 +8,7 @@ write the code.
 
 import datetime as dt
 import hmac
+import json
 import logging
 import os
 import re
@@ -284,6 +285,8 @@ def media_full(m):
 def story_json(st):
     return {
         "id": str(st.pk),
+        "media_id": st.id,
+        "owner": str(st.user.pk) if st.user else None,
         "type": st.media_type,
         "img": s(st.thumbnail_url),
         "video": s(st.video_url),
@@ -461,6 +464,61 @@ def highlight(highlight_id: str):
     return {"id": h.pk, "title": h.title, "items": [story_json(st) for st in h.items]}
 
 
+class StoryLike(BaseModel):
+    media_id: str
+    like: bool
+
+
+@app.post("/api/stories/like")
+def story_like(body: StoryLike):
+    ig.run(lambda cl: cl.story_like(body.media_id, revert=not body.like, mark_seen=False), kind="like")
+    return {"liked": body.like}
+
+
+class StoryReply(BaseModel):
+    media_id: str
+    owner: str
+    text: str
+    video: bool = False
+
+
+def send_story_reply(cl, media_id: str, owner: str, text: str, video: bool):
+    """A reply that shows the story it's answering, like the official app's.
+    instagrapi has no helper for this, so this is the app's own reel_share call."""
+    token = cl.generate_mutation_token()
+    data = {
+        "action": "send_item",
+        "is_shh_mode": "0",
+        "send_attribution": "reel_feed_timeline",
+        "client_context": token,
+        "mutation_token": token,
+        "offline_threading_id": token,
+        "nav_chain": "1qT:feed_timeline:1,ReelViewerFragment:reel_feed_timeline:4",
+        "recipient_users": json.dumps([[int(owner)]]),
+        "media_id": media_id,
+        "reel_id": str(owner),
+        "text": text,
+        "entry": "reel",
+        "media_type": "video" if video else "photo",
+        "containermodule": "reel_feed_timeline",
+    }
+    return cl.private_request("direct_v2/threads/broadcast/reel_share/", data=cl.with_default_data(data), with_signature=False)
+
+
+@app.post("/api/stories/reply")
+def story_reply(body: StoryReply):
+    text = body.text.strip()
+    try:
+        ig.run(send_story_reply, body.media_id, body.owner, text, body.video, kind="dm", soft=True)
+        linked = True
+    except ClientError:
+        # If Instagram won't take a story reply, still get the words to them.
+        ig.run(lambda cl: cl.direct_send(text, user_ids=[int(body.owner)]), kind="dm")
+        linked = False
+    ig.forget("inbox:")
+    return {"ok": True, "linked": linked}
+
+
 class Ids(BaseModel):
     ids: list[str]
 
@@ -503,7 +561,7 @@ def image(u: str):
 
 # -- today: posts and stories from people you follow, 5 minutes once a day -----
 
-DAILY_MINUTES = 5
+DAILY_MINUTES = 8
 DAILY_MAX_AGE = dt.timedelta(days=7)  # older posts are skipped
 
 
@@ -534,7 +592,7 @@ class DailyOver(Exception):
 
 @app.exception_handler(DailyOver)
 def daily_over(request, exc):
-    return err(403, "daily_over", "That's today's 5 minutes. See you tomorrow.")
+    return err(403, "daily_over", f"That's today's {DAILY_MINUTES} minutes. See you tomorrow.")
 
 
 def require_daily_open():
@@ -588,10 +646,8 @@ def feed_verdict(media: dict) -> str:
     return "keep" if fs.get("following") else "not_following"
 
 
-@app.get("/api/daily/feed")
-def daily_feed(cursor: str = ""):
-    require_daily_open()
-    day = local_now().date().isoformat()
+def daily_page(day: str, cursor: str):
+    """One timeline page, filtered. Instagram sends ~5 posts a page, often 3 of them suggestions."""
 
     def fetch(cl):  # with a cursor, instagrapi switches the reason to "pagination"
         return cl.get_timeline_feed("cold_start_fetch", max_id=cursor or None)
@@ -619,10 +675,30 @@ def daily_feed(cursor: str = ""):
             tally["too_old"] += 1
             continue
         items.append(m)
-    # Counts only, no content: lets us tune the filter from the logs.
-    log.info("daily feed page=%s shown=%d %s", "next" if cursor else "first", len(items), dict(tally))
     more = raw.get("more_available") and raw.get("next_max_id")
-    return {"items": items, "next": more or None}
+    return items, more or None, tally
+
+
+@app.get("/api/daily/feed")
+def daily_feed(cursor: str = ""):
+    """A batch of posts: keeps reading pages until there's enough to scroll through."""
+    require_daily_open()
+    day = local_now().date().isoformat()
+    target = 8 if cursor else 4  # small first batch so the tab opens fast
+    items, seen, tally, pages = [], set(), Counter(), 0
+    while pages < 4:
+        page, cursor, t = daily_page(day, cursor)
+        pages += 1
+        tally.update(t)
+        for m in page:
+            if m["id"] not in seen:
+                seen.add(m["id"])
+                items.append(m)
+        if not cursor or len(items) >= target:
+            break
+    # Counts only, no content: lets us tune the filter from the logs.
+    log.info("daily feed pages=%d shown=%d %s", pages, len(items), dict(tally))
+    return {"items": items, "next": cursor}
 
 
 @app.get("/api/daily/stories")

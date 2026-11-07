@@ -552,7 +552,7 @@ function Profile({ username }) {
   return html`<div class="page">
     <${TopBar}
       title=${html`<${Name} u=${u} />`}
-      left=${p?.me ? html`<span></span>` : undefined}
+      left=${p?.me ? html`<${Link} href="/new" class="icon" aria-label="New post">${I.plus}<//>` : undefined}
       right=${p?.me && html`<${Link} href="/settings" class="icon">${I.gear}<//>`}
     />
     ${ptr}
@@ -960,6 +960,9 @@ function Stories({ username, highlight, user, onClose }) {
   const [paused, setPaused] = useState(false);
   const [progress, setProgress] = useState(0);
   const [drag, setDrag] = useState(0);
+  const [liked, setLiked] = useState({});
+  const [replying, setReplying] = useState(false);
+  const [reply, setReply] = useState("");
   const seen = useRef(new Set());
   const video = useRef();
   const elapsed = useRef(0);
@@ -1009,6 +1012,36 @@ function Stories({ username, highlight, user, onClose }) {
       });
   }, [paused, cur?.id]);
 
+  const mineStory = prof?.id && prof.id === me.id;
+  const likeStory = async () => {
+    const on = !liked[cur.id];
+    setLiked((x) => ({ ...x, [cur.id]: on }));
+    try {
+      await api("/api/stories/like", { method: "POST", body: { media_id: cur.media_id, like: on } });
+    } catch (e) {
+      setLiked((x) => ({ ...x, [cur.id]: !on }));
+      toast(e.message);
+    }
+  };
+  const sendReply = async (e) => {
+    e.preventDefault();
+    const text = reply.trim();
+    if (!text) return;
+    const story = cur;
+    setReply("");
+    setReplying(false);
+    setPaused(false);
+    try {
+      const r = await api("/api/stories/reply", {
+        method: "POST",
+        body: { media_id: story.media_id, owner: story.owner || prof.id, text, video: !!story.video },
+      });
+      toast(r.linked ? "Sent" : "Sent as a message");
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+
   const onDown = (e) => {
     gesture.current = { x: e.clientX, y: e.clientY, t: Date.now(), hold: setTimeout(() => setPaused(true), 180) };
   };
@@ -1057,6 +1090,20 @@ function Stories({ username, highlight, user, onClose }) {
                 ></video>`
               : html`<img key=${cur.id} src=${cur.img} referrerpolicy="no-referrer" alt="" />`}
           </div>
+          ${!mineStory &&
+          html`<form class=${`story-foot ${replying ? "typing" : ""}`} onSubmit=${sendReply}>
+            <input
+              placeholder=${`Reply to ${username}…`}
+              value=${reply}
+              enterkeyhint="send"
+              onFocus=${() => (setReplying(true), setPaused(true))}
+              onBlur=${() => !reply.trim() && (setReplying(false), setPaused(false))}
+              onInput=${(e) => setReply(e.target.value)}
+            />
+            ${replying
+              ? html`<button class="send-reply" disabled=${!reply.trim()}>Send</button>`
+              : html`<button type="button" class=${`icon story-like ${liked[cur.id] ? "on" : ""}`} onClick=${likeStory}>${I.heart}</button>`}
+          </form>`}
         `}
   </div>`;
 }
@@ -1077,67 +1124,89 @@ function untilText(seconds) {
   return h ? `${h}h ${m}m` : `${m}m`;
 }
 
+/* Only this re-renders every half second, not the whole feed. */
+function Countdown({ deadline, onEnd }) {
+  const [left, setLeft] = useState(Math.max(0, deadline - Date.now()));
+  const ended = useRef(onEnd);
+  ended.current = onEnd;
+  useEffect(() => {
+    const tick = () => {
+      const l = Math.max(0, deadline - Date.now());
+      setLeft(l);
+      if (l <= 0) ended.current();
+    };
+    tick();
+    const t = setInterval(tick, 500);
+    return () => clearInterval(t);
+  }, [deadline]);
+  return html`<span class=${`timer ${left < 30000 ? "low" : ""}`}>${clock(left)}</span>`;
+}
+
 function Today() {
   const [st, setSt] = useState(null);
   const [deadline, setDeadline] = useState(null);
-  const [left, setLeft] = useState(0);
   const [stories, setStories] = useState(null);
   const [posts, setPosts] = useState(null);
   const [next, setNext] = useState(null);
-  const [more, setMore] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [nearEnd, setNearEnd] = useState(false);
   const [viewer, setViewer] = useState(null);
   const [error, setError] = useState(null);
+  const sentinel = useRef();
 
   const apply = (x) => {
     setSt(x);
     setDeadline(x.status === "open" ? Date.now() + x.remaining * 1000 : null);
   };
-  const end = () => {
+  const end = useCallback(() => {
     setViewer(null);
     setPosts(null);
     setStories(null);
     setDeadline(null);
     setSt((x) => ({ ...x, status: "done" }));
     api("/api/daily").then(apply).catch(() => {});
-  };
+  }, []);
   const fail = (e) => (e.code === "daily_over" ? end() : setError(e));
 
   useEffect(() => {
     api("/api/daily").then(apply).catch(setError);
   }, []);
 
-  useEffect(() => {
-    if (st?.status !== "open") return;
-    api("/api/daily/stories").then(setStories).catch(() => setStories([]));
-    api("/api/daily/feed")
-      .then((r) => (setPosts(r.items), setNext(r.next)))
-      .catch(fail);
-  }, [st?.status]);
-
-  useEffect(() => {
-    if (!deadline) return;
-    const tick = () => {
-      const l = Math.max(0, deadline - Date.now());
-      setLeft(l);
-      if (l <= 0) end();
-    };
-    tick();
-    const t = setInterval(tick, 500);
-    return () => clearInterval(t);
-  }, [deadline]);
-
-  const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
-  const loadMore = () => {
-    setMore(true);
-    api(`/api/daily/feed?cursor=${encodeURIComponent(next)}`)
+  const load = (cursor) => {
+    setLoading(true);
+    return api(`/api/daily/feed${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`)
       .then((r) => {
-        setPosts((p) => [...p, ...r.items.filter((m) => !p.some((x) => x.id === m.id))]);
+        setPosts((p) => {
+          const have = new Set((p || []).map((x) => x.id));
+          return [...(p || []), ...r.items.filter((m) => !have.has(m.id))];
+        });
         setNext(r.next);
       })
       .catch(fail)
-      .finally(() => setMore(false));
+      .finally(() => setLoading(false));
   };
-  const update = (nm) => setPosts((p) => p.map((x) => (x.id === nm.id ? nm : x)));
+
+  useEffect(() => {
+    if (st?.status !== "open") return;
+    api("/api/daily/stories").then(setStories).catch(() => setStories([]));
+    load(null);
+  }, [st?.status]);
+
+  // Keep a batch ahead: start loading well before you reach the bottom.
+  useEffect(() => {
+    const el = sentinel.current;
+    if (!el) return;
+    const io = new IntersectionObserver(([e]) => setNearEnd(e.isIntersecting), { rootMargin: "2500px 0px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [posts !== null]);
+  useEffect(() => {
+    if (nearEnd && next && !loading) load(next);
+  }, [nearEnd, next, loading]);
+
+  const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
+  const update = useCallback((nm) => setPosts((p) => p.map((x) => (x.id === nm.id ? nm : x))), []);
+  const minutes = st?.minutes || 8;
 
   if (error) return html`<${TopBar} left=${html`<span></span>`} title="Today" /><${ErrorView} error=${error} />`;
   if (!st) return html`<${TopBar} left=${html`<span></span>`} title="Today" /><${Spinner} />`;
@@ -1147,7 +1216,7 @@ function Today() {
       <${TopBar} left=${html`<span></span>`} title="Today" />
       <div class="today-gate">
         <div class="today-icon">${I.sun}</div>
-        <h2>Your 5 minutes</h2>
+        <h2>Your ${minutes} minutes</h2>
         <p class="muted">Posts and stories from people you follow. Once a day, then it closes until tomorrow.</p>
         <button class="btn" onClick=${start}>Start</button>
         <small class="muted">The timer keeps running if you leave.</small>
@@ -1160,16 +1229,12 @@ function Today() {
       <div class="today-gate">
         <div class="today-icon done">${I.sun}</div>
         <h2>See you tomorrow</h2>
-        <p class="muted">Today's 5 minutes are used. Opens again in ${untilText(st.resets_in)}.</p>
+        <p class="muted">Today's ${minutes} minutes are used. Opens again in ${untilText(st.resets_in)}.</p>
       </div>
     </div>`;
 
   return html`<div class="page">
-    <${TopBar}
-      left=${html`<span></span>`}
-      title="Today"
-      right=${html`<span class=${`timer ${left < 30000 ? "low" : ""}`}>${clock(left)}</span>`}
-    />
+    <${TopBar} left=${html`<span></span>`} title="Today" right=${deadline && html`<${Countdown} deadline=${deadline} onEnd=${end} />`} />
     ${stories?.length > 0 &&
     html`<div class="tray">
       ${stories.map(
@@ -1179,14 +1244,15 @@ function Today() {
         </button>`
       )}
     </div>`}
-    ${!posts
+    ${posts === null
       ? html`<${Spinner} />`
-      : !posts.length && !next
+      : !posts.length && !next && !loading
       ? html`<${Empty}><p class="muted">Nothing new from people you follow.</p><//>`
-      : html`${posts.map((m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`)}
-          ${next
-            ? html`<button class="btn ghost more wide" disabled=${more} onClick=${loadMore}>${more ? "Loading…" : "Show more"}</button>`
-            : html`<p class="caught-up muted">${I.check} You're all caught up</p>`}`}
+      : posts.map((m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`)}
+    <div ref=${sentinel} class="sentinel"></div>
+    ${posts !== null && (next || loading)
+      ? html`<${Spinner} />`
+      : posts?.length > 0 && html`<p class="caught-up muted">${I.check} You're all caught up</p>`}
     ${viewer &&
     html`<${Stories}
       key=${viewer.id}
@@ -1259,14 +1325,10 @@ function Bubble({ m }) {
   const share = m.share;
   return html`<div class="bubble">
     ${share
-      ? html`<${Link}
-          href=${share.media ? `/p/${share.media}` : share.code ? `/c/${share.code}` : "#"}
-          class="share"
-          onClick=${share.media || share.code ? undefined : (e) => e.preventDefault()}
-        >
+      ? html`<div class="share">
           <${Img} src=${share.img} />
           <small>${share.label}${share.user ? ` · @${share.user}` : ""}</small>
-        <//>`
+        </div>`
       : m.media
       ? m.media.video
         ? html`<video src=${m.media.video} poster=${m.media.img} controls playsinline preload="none"></video>`
@@ -1286,18 +1348,29 @@ function Reactable({ m, onReact, children }) {
   const [picker, setPicker] = useState(false);
   const press = useRef(null);
   const lastTap = useRef(0);
+  const single = useRef(null);
   const canReact = onReact && !String(m.id).startsWith("local-");
+  // A shared post opens on a single tap, but only once we know it isn't a double tap.
+  const href = m.share ? (m.share.media ? `/p/${m.share.media}` : m.share.code ? `/c/${m.share.code}` : null) : null;
   const down = () => {
+    if (m.share?.media) prefetch(`/api/p/${m.share.media}`, 60000);
     if (!canReact) return;
     press.current = setTimeout(() => ((press.current = null), setPicker(true), navigator.vibrate?.(10)), 450);
   };
   const up = () => {
-    if (!press.current) return;
+    if (canReact && !press.current) return; // that was a long press
     clearTimeout(press.current);
     press.current = null;
     const now = Date.now();
-    if (now - lastTap.current < 300) onReact(m, "❤️");
+    if (canReact && now - lastTap.current < 280) {
+      clearTimeout(single.current);
+      single.current = null;
+      lastTap.current = 0;
+      onReact(m, "❤️");
+      return;
+    }
     lastTap.current = now;
+    if (href) single.current = setTimeout(() => ((single.current = null), navigate(href)), canReact ? 280 : 0);
   };
   const cancel = () => press.current && (clearTimeout(press.current), (press.current = null));
   const counts = {};
@@ -1525,7 +1598,7 @@ function NewPost() {
   };
 
   return html`<div class="page">
-    <${TopBar} left=${html`<span></span>`} title="New" right=${file && html`<button class="link" disabled=${progress != null} onClick=${share}>Share</button>`} />
+    <${TopBar} title="New" right=${file && html`<button class="link" disabled=${progress != null} onClick=${share}>Share</button>`} />
     <div class="segmented">
       <button class=${where === "feed" ? "on" : ""} onClick=${() => setWhere("feed")}>Post</button>
       <button class=${where === "story" ? "on" : ""} onClick=${() => setWhere("story")}>Story</button>
@@ -1599,7 +1672,7 @@ function route(path, search, status, refreshStatus) {
   if (path === "/dm/requests") return { tab: "dm", el: html`<${Inbox} requests=${true} />` };
   if ((m = path.match(/^\/dm\/new\/([^/]+)$/))) return { bare: true, el: html`<${NewThread} username=${d(m[1])} />` };
   if ((m = path.match(/^\/dm\/(\d+)$/))) return { bare: true, el: html`<${Thread} id=${m[1]} />` };
-  if (path === "/new") return { tab: "new", el: html`<${NewPost} />` };
+  if (path === "/new") return { tab: "me", el: html`<${NewPost} />` };
   if (path === "/today") return { tab: "today", el: html`<${Today} />` };
   if (path === "/me") return { tab: "me", el: html`<${Profile} username=${me.username} />` };
   if (path === "/requests") return { tab: "me", el: html`<${Requests} />` };
@@ -1615,10 +1688,9 @@ function TabBar({ tab }) {
   };
   const meUser = peeks.users.get(me.username.toLowerCase()) || store.get(`/api/u/${encodeURIComponent(me.username)}`)?.data;
   return html`<nav class="tabbar">
-    <a href="/" class=${tab === "search" ? "on" : ""} onClick=${go("/", "search")}>${I.search}</a>
     <a href="/today" class=${tab === "today" ? "on" : ""} onClick=${go("/today", "today")}>${I.sun}</a>
+    <a href="/" class=${tab === "search" ? "on" : ""} onClick=${go("/", "search")}>${I.search}</a>
     <a href="/dm" class=${tab === "dm" ? "on" : ""} onClick=${go("/dm", "dm")}>${I.send}</a>
-    <a href="/new" class=${tab === "new" ? "on" : ""} onClick=${go("/new", "new")}>${I.plus}</a>
     <a href="/me" class=${tab === "me" ? "on" : ""} onClick=${go("/me", "me")}>
       ${meUser?.pic ? html`<${Avatar} src=${meUser.pic} size=${26} />` : html`<span class="me-dot"></span>`}
     </a>
@@ -1664,7 +1736,7 @@ function Main({ status, refreshStatus }) {
   me = { username: status.username, id: status.user_id };
   const r = useRoute();
   const { tab, bare, el } = route(r.path, r.search, status, refreshStatus);
-  const isRoot = ["/", "/today", "/dm", "/new", "/me"].includes(r.path);
+  const isRoot = ["/", "/today", "/dm", "/me"].includes(r.path);
   const dx = useEdgeSwipe(!isRoot);
   const [online, setOnline] = useState(navigator.onLine);
 

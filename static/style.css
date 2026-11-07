@@ -1552,3 +1552,54 @@ img.loaded,
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ---- story footer: like and reply, out of the way ------------------------- */
+
+.story-foot {
+  position: absolute;
+  z-index: 3;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 28px 12px calc(var(--bottom) + 10px);
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.35));
+}
+.story-foot input {
+  flex: 1;
+  height: 44px;
+  padding: 0 18px;
+  border-radius: 22px;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  background: transparent;
+  color: #fff;
+}
+.story-foot input::placeholder {
+  color: rgba(255, 255, 255, 0.85);
+}
+.story-foot.typing input {
+  background: rgba(0, 0, 0, 0.45);
+  border-color: rgba(255, 255, 255, 0.8);
+}
+.story-foot .story-like {
+  color: #fff;
+}
+.story-foot .story-like svg {
+  width: 28px;
+  height: 28px;
+}
+.story-foot .story-like.on svg {
+  fill: #ff3040;
+  stroke: #ff3040;
+  animation: pop 0.25s ease;
+}
+.send-reply {
+  color: #fff;
+  font-weight: 700;
+  padding: 0 6px;
+}
+.sentinel {
+  height: 1px;
+}

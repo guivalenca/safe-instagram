@@ -299,7 +299,7 @@ class IG:
             if wait > 0:
                 time.sleep(wait)
             try:
-                return self._call(fn, args, kwargs, write=True)
+                return self._call(fn, args, kwargs, write=True, soft=soft)
             finally:
                 self._last_write = self._last_by_kind[kind] = time.monotonic()
 
