@@ -1250,3 +1250,107 @@ img.loaded,
   border-radius: 50%;
   border: 2px solid currentColor;
 }
+
+/* ---- today -------------------------------------------------------------- */
+
+.today-gate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 72px 36px;
+  text-align: center;
+}
+.today-gate h2 {
+  margin: 8px 0 0;
+  font-size: 22px;
+}
+.today-gate p {
+  margin: 0 0 8px;
+}
+.today-gate .btn {
+  height: 44px;
+  min-width: 180px;
+  font-size: 15px;
+}
+.today-icon {
+  display: grid;
+  place-items: center;
+  width: 76px;
+  height: 76px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 20%, #7046ba, #2a1550);
+  color: #f6f2fd;
+}
+.today-icon svg {
+  width: 40px;
+  height: 40px;
+  stroke-width: 1.6;
+}
+.today-icon.done {
+  background: var(--bg-3);
+  color: var(--fg-2);
+}
+.timer {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  font-size: 14px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: var(--bg-2);
+}
+.timer.low {
+  color: #fff;
+  background: var(--danger);
+}
+.tray {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  border-bottom: 0.5px solid var(--line);
+}
+.tray::-webkit-scrollbar {
+  display: none;
+}
+.tray-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  width: 70px;
+  flex: none;
+}
+.tray-item > span:last-child {
+  max-width: 100%;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.avatar.ring.seen {
+  background: var(--bg-3);
+}
+.post {
+  padding-bottom: 6px;
+  border-bottom: 0.5px solid var(--line);
+}
+.post .post-user small {
+  font-weight: 400;
+}
+.more.wide {
+  display: flex;
+  width: calc(100% - 32px);
+}
+.caught-up {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 28px 16px 40px;
+}
+.caught-up svg {
+  width: 18px;
+  height: 18px;
+}

@@ -6,15 +6,19 @@ notifications, and no setting to turn them on. To get them back you'd have to
 write the code.
 """
 
+import datetime as dt
 import hmac
+import logging
 import os
 import re
 import secrets
 import tempfile
 import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlparse
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -30,7 +34,7 @@ from instagrapi.exceptions import (
     RateLimitError,
 )
 import requests
-from instagrapi.extractors import extract_user_v1
+from instagrapi.extractors import extract_media_v1, extract_user_v1
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from pydantic import BaseModel
@@ -49,6 +53,7 @@ from ig import (
 )
 
 register_heif_opener()
+log = logging.getLogger("uvicorn.error")
 
 HERE = Path(__file__).parent
 STATIC = HERE / "static"
@@ -257,6 +262,9 @@ def media_full(m):
     else:
         items = [{"type": m.media_type, "img": s(m.thumbnail_url), "video": s(m.video_url)}]
     dims = m.dimensions
+    if not (dims and dims.width and dims.height):
+        cands = getattr(getattr(m, "image_versions2", None), "candidates", None) or []
+        dims = next((c for c in cands if getattr(c, "width", 0) and getattr(c, "height", 0)), None)
     return {
         "id": str(m.pk),
         "media_id": m.id,
@@ -482,6 +490,147 @@ def image(u: str):
         media_type=r.headers.get("content-type", "image/jpeg"),
         headers={"Cache-Control": "private, max-age=86400"},
     )
+
+
+# -- today: posts and stories from people you follow, 5 minutes once a day -----
+
+DAILY_MINUTES = 5
+DAILY_MAX_AGE = dt.timedelta(days=7)  # older posts are skipped
+
+
+def local_now() -> dt.datetime:
+    try:
+        tz = ZoneInfo(ig.state().get("timezone") or "UTC")
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return dt.datetime.now(tz)
+
+
+def daily_status() -> dict:
+    now = local_now()
+    tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    base = {"minutes": DAILY_MINUTES, "resets_in": int((tomorrow - now).total_seconds())}
+    d = ig.state().get("daily") or {}
+    if d.get("date") != now.date().isoformat():
+        return {**base, "status": "ready"}
+    left = (dt.datetime.fromisoformat(d["ends"]) - dt.datetime.now(dt.timezone.utc)).total_seconds()
+    if left > 0:
+        return {**base, "status": "open", "remaining": left}
+    return {**base, "status": "done"}
+
+
+class DailyOver(Exception):
+    pass
+
+
+@app.exception_handler(DailyOver)
+def daily_over(request, exc):
+    return err(403, "daily_over", "That's today's 5 minutes. See you tomorrow.")
+
+
+def require_daily_open():
+    if daily_status()["status"] != "open":
+        raise DailyOver()
+
+
+@app.get("/api/daily")
+def daily():
+    return daily_status()
+
+
+@app.post("/api/daily/start")
+def daily_start():
+    st = daily_status()
+    if st["status"] == "ready":
+        ends = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=DAILY_MINUTES)
+        ig.update_state(daily={"date": local_now().date().isoformat(), "ends": ends.isoformat()})
+        st = daily_status()
+    return st
+
+
+def raw_user(u: dict) -> dict:
+    return {
+        "id": str(u.get("pk") or u.get("pk_id") or u.get("id")),
+        "username": u.get("username", ""),
+        "name": u.get("full_name") or "",
+        "pic": u.get("profile_pic_url"),
+        "verified": bool(u.get("is_verified")),
+        "private": bool(u.get("is_private")),
+    }
+
+
+# Fields that mark an ad or a recommendation. They only count when they have a value:
+# ordinary posts often carry some of them empty.
+PROMO_FIELDS = ("ad_id", "ad_action", "ad_metadata", "injected", "is_ad", "dr_ad_type", "is_paid_partnership")
+SUGGESTION_FIELDS = ("explore_context", "is_recommended", "recommendation_data", "suggested_users")
+
+
+def feed_verdict(media: dict) -> str:
+    """'keep', or why a timeline item is dropped: ads, suggestions, accounts you don't follow."""
+    if any(media.get(k) for k in PROMO_FIELDS):
+        return "ad"
+    if any(media.get(k) for k in SUGGESTION_FIELDS):
+        return "suggested"
+    fs = (media.get("user") or {}).get("friendship_status")
+    if fs is None:
+        return "keep_no_fs"  # Instagram didn't say; only people you follow are in the timeline otherwise
+    return "keep" if fs.get("following") else "not_following"
+
+
+@app.get("/api/daily/feed")
+def daily_feed(cursor: str = ""):
+    require_daily_open()
+    day = local_now().date().isoformat()
+
+    def fetch(cl):  # with a cursor, instagrapi switches the reason to "pagination"
+        return cl.get_timeline_feed("cold_start_fetch", max_id=cursor or None)
+
+    raw = ig.cached(f"daily:feed:{day}:{cursor}", 600, fetch)
+    cutoff = dt.datetime.now(dt.timezone.utc) - DAILY_MAX_AGE
+    items, tally = [], Counter()
+    for it in raw.get("feed_items") or []:
+        media = it.get("media_or_ad")
+        if not media:
+            tally["other_module"] += 1
+            continue
+        verdict = feed_verdict(media)
+        tally[verdict] += 1
+        if not verdict.startswith("keep"):
+            continue
+        try:
+            m = media_full(extract_media_v1(dict(media)))
+        except Exception:
+            tally["unparsed"] += 1
+            continue
+        if not m["ratio"] and media.get("original_width") and media.get("original_height"):
+            m["ratio"] = media["original_width"] / media["original_height"]
+        if dt.datetime.fromisoformat(m["taken_at"]) < cutoff:
+            tally["too_old"] += 1
+            continue
+        items.append(m)
+    # Counts only, no content: lets us tune the filter from the logs.
+    log.info("daily feed page=%s shown=%d %s", "next" if cursor else "first", len(items), dict(tally))
+    more = raw.get("more_available") and raw.get("next_max_id")
+    return {"items": items, "next": more or None}
+
+
+@app.get("/api/daily/stories")
+def daily_stories():
+    require_daily_open()
+    day = local_now().date().isoformat()
+    raw = ig.cached(f"daily:tray:{day}", 600, lambda cl: cl.get_reels_tray_feed("cold_start"))
+    out = []
+    for reel in raw.get("tray") or []:
+        u = reel.get("user") or {}
+        fs = u.get("friendship_status") or {}
+        if reel.get("reel_type", "user_reel") != "user_reel" or fs.get("following") is False or not u.get("username"):
+            continue
+        if str(u.get("pk") or u.get("pk_id")) == ig.user_id:
+            continue
+        unseen = (reel.get("seen") or 0) < (reel.get("latest_reel_media") or 0)
+        out.append({**raw_user(u), "unseen": unseen})
+    out.sort(key=lambda x: not x["unseen"])  # new ones first, like the real app
+    return out
 
 
 # -- follow requests -----------------------------------------------------------

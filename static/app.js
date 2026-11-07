@@ -212,6 +212,7 @@ const I = {
   heart: html`<svg viewBox="0 0 24 24"><path d="M12 20s-7.5-4.6-9.3-9.2C1.4 7.4 3.6 4 7.1 4c2 0 3.4 1.1 4.9 3 1.5-1.9 2.9-3 4.9-3 3.5 0 5.7 3.4 4.4 6.8C19.5 15.4 12 20 12 20z"/></svg>`,
   gear: html`<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`,
   x: html`<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>`,
+  sun: html`<svg viewBox="0 0 24 24"><path d="M3 18h18M6.5 18a5.5 5.5 0 0 1 11 0"/><path d="M12 7V4M5.2 10.2 3.6 8.6M18.8 10.2l1.6-1.6"/></svg>`,
   lock: html`<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>`,
   camera: html`<svg viewBox="0 0 24 24"><rect x="3.96" y="3.96" width="16.08" height="16.08" rx="4.32"/><circle cx="12" cy="12" r="3.7"/><circle cx="16.51" cy="7.44" r="1.03" class="dot"/></svg>`,
   album: html`<svg viewBox="0 0 24 24" class="fill"><path d="M7 3h12a2 2 0 0 1 2 2v12h-2V5H7z"/><rect x="3" y="7" width="14" height="14" rx="2"/></svg>`,
@@ -751,24 +752,31 @@ function Post({ id }) {
   const key = `/api/p/${id}`;
   const { data: m, error, refresh } = useQuery(key, 60000);
   const peek = peeks.media.get(id);
-  const [idx, setIdx] = useState(0);
-  const [burst, setBurst] = useState(0);
-  const lastTap = useRef(0);
-
   if (!m) {
     return html`<div class="page">
       <${TopBar} title="Post" />
       ${error ? html`<${ErrorView} error=${error} retry=${refresh} />` : html`<div class="media" style="aspect-ratio:1"><${Img} src=${peek?.thumb} class="media-img" /></div><${Spinner} />`}
     </div>`;
   }
+  return html`<div class="page">
+    <${TopBar} title="Post" />
+    <${PostCard} m=${m} onChange=${(nm) => setData(key, nm)} />
+  </div>`;
+}
+
+/* One post: header, swipeable media, double-tap to like, caption. */
+function PostCard({ m, onChange, showTime = false }) {
+  const [idx, setIdx] = useState(0);
+  const [burst, setBurst] = useState(0);
+  const lastTap = useRef(0);
 
   const like = async (on) => {
-    const before = store.get(key).data;
-    setData(key, { ...m, liked: on, likes: m.likes == null ? null : m.likes + (on ? 1 : -1) });
+    const before = m;
+    onChange({ ...m, liked: on, likes: m.likes == null ? null : m.likes + (on ? 1 : -1) });
     try {
-      await api(`/api/p/${id}/like`, { method: "POST", body: { media_id: m.media_id, like: on } });
+      await api(`/api/p/${m.id}/like`, { method: "POST", body: { media_id: m.media_id, like: on } });
     } catch (e) {
-      setData(key, before);
+      onChange(before);
       toast(e.message);
     }
   };
@@ -783,11 +791,11 @@ function Post({ id }) {
   };
   const ratio = Math.min(1.91, Math.max(0.8, m.ratio || 1));
 
-  return html`<div class="page">
-    <${TopBar} title="Post" />
+  return html`<article class="post">
     <${Link} href=${`/u/${encodeURIComponent(m.user.username)}`} warm=${() => warmUser(m.user)} class="post-user">
       <${Avatar} src=${m.user.pic} size=${32} />
       <${Name} u=${m.user} />
+      ${showTime && html`<small class="muted">· ${ago(m.taken_at)}</small>`}
     <//>
     <div class="media" style=${`aspect-ratio:${ratio}`} onClick=${tap}>
       <div class="carousel" onScroll=${(e) => setIdx(Math.round(e.target.scrollLeft / e.target.clientWidth))}>
@@ -806,9 +814,9 @@ function Post({ id }) {
       <button class=${`icon like ${m.liked ? "on" : ""}`} onClick=${() => like(!m.liked)}>${I.heart}</button>
       ${m.likes != null && html`<b>${count(m.likes)} ${m.likes === 1 ? "like" : "likes"}</b>`}
       ${m.caption && html`<p class="caption"><b>${m.user.username}</b> ${m.caption}</p>`}
-      <small class="muted">${new Date(m.taken_at).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}</small>
+      ${!showTime && html`<small class="muted">${new Date(m.taken_at).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })}</small>`}
     </div>
-  </div>`;
+  </article>`;
 }
 
 function CodeRedirect({ code }) {
@@ -825,8 +833,9 @@ function CodeRedirect({ code }) {
    Stories: one person at a time. When theirs end, you're back on their profile.
    ========================================================================== */
 
-function Stories({ username, highlight }) {
-  const prof = useQuery(`/api/u/${encodeURIComponent(username)}`, 60000).data || peeks.users.get(username.toLowerCase());
+function Stories({ username, highlight, user, onClose }) {
+  const profQ = useQuery(user ? null : `/api/u/${encodeURIComponent(username)}`, 60000).data;
+  const prof = user || profQ || peeks.users.get(username.toLowerCase());
   const id = prof?.id;
   const key = highlight ? `/api/highlight/${highlight}` : id ? `/api/u/${id}/stories` : null;
   const q = useQuery(key, highlight ? 10 * 60000 : 60000);
@@ -844,7 +853,8 @@ function Stories({ username, highlight }) {
 
   const close = () => {
     if (!highlight && seen.current.size) api("/api/stories/seen", { method: "POST", body: { ids: [...seen.current] } }).catch(() => {});
-    back(`/u/${encodeURIComponent(username)}`);
+    if (onClose) onClose();
+    else back(`/u/${encodeURIComponent(username)}`);
   };
   const next = () => (items && i < items.length - 1 ? setI(i + 1) : close());
   const prev = () => (i > 0 ? setI(i - 1) : ((elapsed.current = 0), setProgress(0), video.current && (video.current.currentTime = 0)));
@@ -933,6 +943,145 @@ function Stories({ username, highlight }) {
               : html`<img key=${cur.id} src=${cur.img} referrerpolicy="no-referrer" alt="" />`}
           </div>
         `}
+  </div>`;
+}
+
+/* ==========================================================================
+   Today: posts and stories from people you follow. Five minutes, once a day,
+   enforced by the server, so closing the app doesn't reset it.
+   ========================================================================== */
+
+function clock(ms) {
+  const t = Math.ceil(ms / 1000);
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
+}
+
+function untilText(seconds) {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m`;
+}
+
+function Today() {
+  const [st, setSt] = useState(null);
+  const [deadline, setDeadline] = useState(null);
+  const [left, setLeft] = useState(0);
+  const [stories, setStories] = useState(null);
+  const [posts, setPosts] = useState(null);
+  const [next, setNext] = useState(null);
+  const [more, setMore] = useState(false);
+  const [viewer, setViewer] = useState(null);
+  const [error, setError] = useState(null);
+
+  const apply = (x) => {
+    setSt(x);
+    setDeadline(x.status === "open" ? Date.now() + x.remaining * 1000 : null);
+  };
+  const end = () => {
+    setViewer(null);
+    setPosts(null);
+    setStories(null);
+    setDeadline(null);
+    setSt((x) => ({ ...x, status: "done" }));
+    api("/api/daily").then(apply).catch(() => {});
+  };
+  const fail = (e) => (e.code === "daily_over" ? end() : setError(e));
+
+  useEffect(() => {
+    api("/api/daily").then(apply).catch(setError);
+  }, []);
+
+  useEffect(() => {
+    if (st?.status !== "open") return;
+    api("/api/daily/stories").then(setStories).catch(() => setStories([]));
+    api("/api/daily/feed")
+      .then((r) => (setPosts(r.items), setNext(r.next)))
+      .catch(fail);
+  }, [st?.status]);
+
+  useEffect(() => {
+    if (!deadline) return;
+    const tick = () => {
+      const l = Math.max(0, deadline - Date.now());
+      setLeft(l);
+      if (l <= 0) end();
+    };
+    tick();
+    const t = setInterval(tick, 500);
+    return () => clearInterval(t);
+  }, [deadline]);
+
+  const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
+  const loadMore = () => {
+    setMore(true);
+    api(`/api/daily/feed?cursor=${encodeURIComponent(next)}`)
+      .then((r) => {
+        setPosts((p) => [...p, ...r.items.filter((m) => !p.some((x) => x.id === m.id))]);
+        setNext(r.next);
+      })
+      .catch(fail)
+      .finally(() => setMore(false));
+  };
+  const update = (nm) => setPosts((p) => p.map((x) => (x.id === nm.id ? nm : x)));
+
+  if (error) return html`<${TopBar} left=${html`<span></span>`} title="Today" /><${ErrorView} error=${error} />`;
+  if (!st) return html`<${TopBar} left=${html`<span></span>`} title="Today" /><${Spinner} />`;
+
+  if (st.status === "ready")
+    return html`<div class="page">
+      <${TopBar} left=${html`<span></span>`} title="Today" />
+      <div class="today-gate">
+        <div class="today-icon">${I.sun}</div>
+        <h2>Your 5 minutes</h2>
+        <p class="muted">Posts and stories from people you follow. Once a day, then it closes until tomorrow.</p>
+        <button class="btn" onClick=${start}>Start</button>
+        <small class="muted">The timer keeps running if you leave.</small>
+      </div>
+    </div>`;
+
+  if (st.status === "done")
+    return html`<div class="page">
+      <${TopBar} left=${html`<span></span>`} title="Today" />
+      <div class="today-gate">
+        <div class="today-icon done">${I.sun}</div>
+        <h2>See you tomorrow</h2>
+        <p class="muted">Today's 5 minutes are used. Opens again in ${untilText(st.resets_in)}.</p>
+      </div>
+    </div>`;
+
+  return html`<div class="page">
+    <${TopBar}
+      left=${html`<span></span>`}
+      title="Today"
+      right=${html`<span class=${`timer ${left < 30000 ? "low" : ""}`}>${clock(left)}</span>`}
+    />
+    ${stories?.length > 0 &&
+    html`<div class="tray">
+      ${stories.map(
+        (u) => html`<button class="tray-item" key=${u.id} onClick=${() => setViewer(u)}>
+          <span class=${`avatar ${u.unseen ? "ring" : "ring seen"}`} style="--s:64px"><${Img} src=${u.pic} /></span>
+          <span>${u.username}</span>
+        </button>`
+      )}
+    </div>`}
+    ${!posts
+      ? html`<${Spinner} />`
+      : !posts.length && !next
+      ? html`<${Empty}><p class="muted">Nothing new from people you follow.</p><//>`
+      : html`${posts.map((m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`)}
+          ${next
+            ? html`<button class="btn ghost more wide" disabled=${more} onClick=${loadMore}>${more ? "Loading…" : "Show more"}</button>`
+            : html`<p class="caught-up muted">${I.check} You're all caught up</p>`}`}
+    ${viewer &&
+    html`<${Stories}
+      key=${viewer.id}
+      username=${viewer.username}
+      user=${viewer}
+      onClose=${() => {
+        setStories((list) => list.map((x) => (x.id === viewer.id ? { ...x, unseen: false } : x)));
+        setViewer(null);
+      }}
+    />`}
   </div>`;
 }
 
@@ -1282,6 +1431,7 @@ function route(path, search, status, refreshStatus) {
   if ((m = path.match(/^\/dm\/new\/([^/]+)$/))) return { bare: true, el: html`<${NewThread} username=${d(m[1])} />` };
   if ((m = path.match(/^\/dm\/(\d+)$/))) return { bare: true, el: html`<${Thread} id=${m[1]} />` };
   if (path === "/new") return { tab: "new", el: html`<${NewPost} />` };
+  if (path === "/today") return { tab: "today", el: html`<${Today} />` };
   if (path === "/me") return { tab: "me", el: html`<${Profile} username=${me.username} />` };
   if (path === "/requests") return { tab: "me", el: html`<${Requests} />` };
   if (path === "/settings") return { tab: "me", el: html`<${Settings} status=${status} refreshStatus=${refreshStatus} />` };
@@ -1297,6 +1447,7 @@ function TabBar({ tab }) {
   const meUser = peeks.users.get(me.username.toLowerCase()) || store.get(`/api/u/${encodeURIComponent(me.username)}`)?.data;
   return html`<nav class="tabbar">
     <a href="/" class=${tab === "search" ? "on" : ""} onClick=${go("/", "search")}>${I.search}</a>
+    <a href="/today" class=${tab === "today" ? "on" : ""} onClick=${go("/today", "today")}>${I.sun}</a>
     <a href="/dm" class=${tab === "dm" ? "on" : ""} onClick=${go("/dm", "dm")}>${I.send}</a>
     <a href="/new" class=${tab === "new" ? "on" : ""} onClick=${go("/new", "new")}>${I.plus}</a>
     <a href="/me" class=${tab === "me" ? "on" : ""} onClick=${go("/me", "me")}>
@@ -1344,7 +1495,7 @@ function Main({ status, refreshStatus }) {
   me = { username: status.username, id: status.user_id };
   const r = useRoute();
   const { tab, bare, el } = route(r.path, r.search, status, refreshStatus);
-  const isRoot = ["/", "/dm", "/new", "/me"].includes(r.path);
+  const isRoot = ["/", "/today", "/dm", "/new", "/me"].includes(r.path);
   const dx = useEdgeSwipe(!isRoot);
   const [online, setOnline] = useState(navigator.onLine);
 

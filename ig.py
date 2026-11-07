@@ -215,6 +215,15 @@ class IG:
     def _state(self) -> dict:
         return read_json(STATE_FILE)
 
+    def state(self) -> dict:
+        return self._state()
+
+    def update_state(self, **values):
+        with self.lock:
+            s = self._state()
+            s.update(values)
+            write_private_json(STATE_FILE, s)
+
     def cooldown(self):
         s = self._state()
         until = s.get("cooldown_until")
