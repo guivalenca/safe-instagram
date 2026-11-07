@@ -189,7 +189,7 @@ class IG:
 
     # -- short-lived cache: collapses prefetch + tap, back/forward, refreshes --
 
-    def cached(self, key: str, ttl: float, fn, *args, **kwargs):
+    def cached(self, key: str, ttl: float, fn, *args, **kwargs):  # kwargs go to run()
         with self.lock:  # checked under the lock, so a duplicate request waits for the first one
             hit = self._cache.get(key)
             if hit and hit[0] > time.monotonic():
@@ -254,15 +254,17 @@ class IG:
 
     # -- the one way in --------------------------------------------------
 
-    def run(self, fn, *args, kind: str | None = None, **kwargs):
+    def run(self, fn, *args, kind: str | None = None, soft: bool = False, **kwargs):
         """Call `fn(client, *args, **kwargs)` safely.
 
         kind=None    -> a read
         kind="seen"  -> marking stories/messages seen: free, silently skipped while paused
         kind=<LIMITS key> -> an action: paced, counted, and blocked during cool-downs
+        soft=True    -> Instagram answers this with a generic error in normal cases
+                        (e.g. a private account's posts), so don't count it as trouble
         """
         if kind is None:
-            return self._call(fn, args, kwargs, write=False)
+            return self._call(fn, args, kwargs, write=False, soft=soft)
         if kind == "seen":
             try:
                 return self._call(fn, args, kwargs, write=True)
@@ -285,7 +287,7 @@ class IG:
             finally:
                 self._last_write = self._last_by_kind[kind] = time.monotonic()
 
-    def _call(self, fn, args, kwargs, write):
+    def _call(self, fn, args, kwargs, write, soft=False):
         with self.lock:
             self._check_cooldown(write)
             cl = self._client()
@@ -312,6 +314,8 @@ class IG:
             except (NotFoundError, PrivateAccount):
                 raise  # normal answers, not trouble
             except ClientError:
+                if soft:
+                    raise
                 s = self._state()
                 s["errors"] = s.get("errors", 0) + 1
                 write_private_json(STATE_FILE, s)

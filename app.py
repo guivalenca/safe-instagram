@@ -13,9 +13,11 @@ import secrets
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import quote, urlparse
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from instagrapi.exceptions import (
     BadPassword,
@@ -27,6 +29,8 @@ from instagrapi.exceptions import (
     PrivateAccount,
     RateLimitError,
 )
+import requests
+from instagrapi.extractors import extract_user_v1
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from pydantic import BaseModel
@@ -360,14 +364,28 @@ def search(q: str = ""):
     return [user_short(u) for u in users[:25]]
 
 
+def user_and_friendship(cl, username):
+    """One request: the profile response already carries our relationship to them."""
+    raw = cl.private_request(f"users/{username}/usernameinfo/")["user"]
+    fs = raw.get("friendship_status") or {}
+    user = extract_user_v1(dict(raw))
+    if "following" not in fs:  # not included this time: ask separately
+        r = cl.user_friendship_v1(user.pk)
+        fs = {"following": r.following, "followed_by": r.followed_by, "outgoing_request": r.outgoing_request}
+    return user, fs
+
+
 @app.get("/api/u/{username}")
 def profile(username: str):
-    u = ig.cached(f"user:{username.lower()}", 120, lambda cl: cl.user_info_by_username_v1(username))
+    u, fs = ig.cached(f"user:{username.lower()}", 120, user_and_friendship, username)
     me = str(u.pk) == ig.user_id
-    rel = None if me else ig.cached(f"rel:{u.pk}", 60, lambda cl: cl.user_friendship_v1(u.pk))
+    rel = None if me else SimpleNamespace(**{k: bool(fs.get(k)) for k in ("following", "followed_by", "outgoing_request")})
+    hd = s(u.profile_pic_url_hd)
     return {
         **user_short(u),
-        "pic_hd": s(u.profile_pic_url_hd) or s(u.profile_pic_url),
+        # Instagram marks HD profile photos "same-origin only", so Safari won't show
+        # them from instagram's CDN directly; they go through /api/img instead.
+        "pic_hd": f"/api/img?u={quote(hd, safe='')}" if hd else s(u.profile_pic_url),
         "bio": u.biography or "",
         "url": u.external_url,
         "posts": u.media_count,
@@ -391,13 +409,14 @@ def posts(user_id: str, cursor: str = ""):
         f"posts:{user_id}:{cursor}",
         300,
         lambda cl: cl.user_medias_paginated_v1(user_id, PAGE_SIZE, end_cursor=cursor),
+        soft=True,
     )
     return {"items": [media_tile(m) for m in medias], "next": next_cursor or None}
 
 
 @app.get("/api/u/{user_id}/stories")
 def stories(user_id: str):
-    items = ig.cached(f"stories:{user_id}", 120, lambda cl: cl.user_stories_v1(user_id))
+    items = ig.cached(f"stories:{user_id}", 120, lambda cl: cl.user_stories_v1(user_id), soft=True)
     return [story_json(st) for st in sorted(items, key=lambda st: st.taken_at)]
 
 
@@ -422,9 +441,23 @@ def follow(user_id: str, body: Follow):
         ig.run(lambda cl: cl.user_follow(user_id), kind="follow")
     else:
         ig.run(lambda cl: cl.user_unfollow(user_id), kind="follow")
-    ig.forget(f"rel:{user_id}", "user:")
+    ig.forget("user:")
     rel = ig.run(lambda cl: cl.user_friendship_v1(user_id))
     return {"following": rel.following, "followed_by": rel.followed_by, "requested": rel.outgoing_request}
+
+
+@app.get("/api/img")
+def image(u: str):
+    host = urlparse(u).hostname or ""
+    if not u.startswith("https://") or not (host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net")):
+        return err(400, "bad_url", "Not an Instagram image.")
+    r = requests.get(u, timeout=10)  # Instagram's public CDN; no account involved
+    return Response(
+        r.content,
+        status_code=r.status_code,
+        media_type=r.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
 
 
 # -- single posts ------------------------------------------------------------
@@ -462,12 +495,13 @@ def inbox(requests: bool = False):
     if requests:
         threads = ig.cached("inbox:requests", 10, lambda cl: cl.direct_pending_inbox(20))
     else:
-        threads = ig.cached("inbox:main", 10, lambda cl: cl.direct_threads(25))
+        # 20 threads = one page; we only show each thread's latest message.
+        threads = ig.cached("inbox:main", 10, lambda cl: cl.direct_threads(20, thread_message_limit=1))
     return [thread_json(t, my_id) for t in threads]
 
 
 @app.get("/api/dm/{thread_id}")
-def thread(thread_id: str, n: int = 30):
+def thread(thread_id: str, n: int = 20):  # Instagram pages messages by 20
     n = max(10, min(n, 200))
     my_id = ig.user_id
     t = ig.cached(f"thread:{thread_id}:{n}", 4, lambda cl: cl.direct_thread(int(thread_id), amount=n))

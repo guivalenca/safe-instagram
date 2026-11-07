@@ -218,11 +218,14 @@ const I = {
   check: html`<svg viewBox="0 0 24 24" class="verified"><circle cx="12" cy="12" r="10"/><path d="m8 12.5 2.6 2.5L16 9.5"/></svg>`,
 };
 
-function Img({ src, class: cls = "", alt = "", ...rest }) {
+function Img({ src, fallback, class: cls = "", alt = "", ...rest }) {
   const [ok, setOk] = useState(false);
+  const [failed, setFailed] = useState(null);
+  if (failed === src && fallback) src = fallback;
   return src
     ? html`<img
         src=${src}
+        onError=${() => fallback && failed !== src && setFailed(src)}
         alt=${alt}
         class=${`${cls} ${ok ? "loaded" : ""}`}
         decoding="async"
@@ -234,9 +237,9 @@ function Img({ src, class: cls = "", alt = "", ...rest }) {
     : html`<span class=${`${cls} img-empty`}></span>`;
 }
 
-function Avatar({ src, size = 44, ring = false, onClick }) {
+function Avatar({ src, fallback, size = 44, ring = false, onClick }) {
   return html`<span class=${`avatar ${ring ? "ring" : ""}`} style=${`--s:${size}px`} onClick=${onClick}>
-    <${Img} src=${src} />
+    <${Img} src=${src} fallback=${fallback} />
   </span>`;
 }
 
@@ -544,7 +547,7 @@ function Profile({ username }) {
     />
     ${ptr}
     <section class="profile-head">
-      <${Avatar} src=${p?.pic_hd || u.pic} size=${86} ring=${hasStories} onClick=${openStories} />
+      <${Avatar} src=${p?.pic_hd || u.pic} fallback=${u.pic} size=${86} ring=${hasStories} onClick=${openStories} />
       <div class="stats">
         <div><b>${count(p?.posts)}</b><span>posts</span></div>
         <div><b>${count(p?.followers)}</b><span>followers</span></div>
@@ -872,7 +875,7 @@ function Inbox({ requests }) {
               <${Link}
                 href=${`/dm/${t.id}`}
                 class="row-main"
-                warm=${() => (peeks.threads.set(t.id, t), prefetch(`/api/dm/${t.id}?n=30`, 4000))}
+                warm=${() => (peeks.threads.set(t.id, t), prefetch(`/api/dm/${t.id}?n=20`, 4000))}
               >
                 <span class=${`avatars n${Math.min(t.users.length, 2)}`}>${t.users.slice(0, 2).map((u) => html`<${Avatar} src=${u.pic} size=${t.users.length > 1 ? 36 : 52} />`)}</span>
                 <span class="row-text">
@@ -963,7 +966,7 @@ function Composer({ onSend, placeholder = "Message…", autofocus = false }) {
 }
 
 function Thread({ id }) {
-  const [n, setN] = useState(30);
+  const [n, setN] = useState(20);
   const key = `/api/dm/${id}?n=${n}`;
   const { data, error, refresh } = useQuery(key, 4000);
   const peek = peeks.threads.get(id);
@@ -1020,7 +1023,7 @@ function Thread({ id }) {
     ${!data && error && html`<${ErrorView} error=${error} retry=${refresh} />`}
     ${!data && !error && html`<${Spinner} />`}
     <div class="messages">
-      ${data && data.messages.length >= n && n < 200 && html`<button class="link small older" onClick=${() => ((stick.current = false), setN(n + 30))}>Load older</button>`}
+      ${data && data.messages.length >= n && n < 200 && html`<button class="link small older" onClick=${() => ((stick.current = false), setN(n + 20))}>Load older</button>`}
       ${data && html`<${Messages} messages=${msgs} users=${data.users} group=${data.group} />`}
     </div>
     <div class="composer-wrap" onClick=${() => (active.current = Date.now())}>
@@ -1242,7 +1245,10 @@ function Main({ status, refreshStatus }) {
   const dx = useEdgeSwipe(!isRoot);
   const [online, setOnline] = useState(navigator.onLine);
 
-  useEffect(() => prefetch(`/api/u/${encodeURIComponent(status.username)}`, 10 * 60000), [status.username]);
+  useEffect(() => {
+    prefetch(`/api/u/${encodeURIComponent(status.username)}`, 10 * 60000);
+    prefetch("/api/dm", 30000);
+  }, [status.username]);
 
   useEffect(() => {
     const f = () => setOnline(navigator.onLine);
