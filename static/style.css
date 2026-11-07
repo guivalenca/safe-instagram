@@ -1075,15 +1075,20 @@ img.loaded,
 .logo {
   display: grid;
   place-items: center;
-  width: 64px;
-  height: 64px;
-  border-radius: 18px;
-  background: linear-gradient(135deg, #4f5bd5, #962fbf 45%, #d62976 75%, #fa7e1e);
+  width: 72px;
+  height: 72px;
+  border-radius: 16px;
+  background: radial-gradient(circle at 30% 107%, rgb(234, 226, 141) 0%, rgb(234, 226, 141) 9%, rgb(224, 91, 78) 58%, rgb(175, 56, 139) 80%, rgb(51, 90, 203) 120%);
   color: #fff;
 }
 .logo svg {
-  width: 30px;
-  height: 30px;
+  width: 38px;
+  height: 38px;
+  stroke-width: 2.1;
+}
+.logo .dot {
+  fill: currentColor;
+  stroke: none;
 }
 
 /* ---- sheet & toast ---------------------------------------------------- */

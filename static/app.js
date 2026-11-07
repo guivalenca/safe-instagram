@@ -213,6 +213,7 @@ const I = {
   gear: html`<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>`,
   x: html`<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>`,
   lock: html`<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>`,
+  camera: html`<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="5.4"/><circle cx="12" cy="12" r="4.1"/><circle cx="16.9" cy="7.1" r="1.1" class="dot"/></svg>`,
   album: html`<svg viewBox="0 0 24 24" class="fill"><path d="M7 3h12a2 2 0 0 1 2 2v12h-2V5H7z"/><rect x="3" y="7" width="14" height="14" rx="2"/></svg>`,
   play: html`<svg viewBox="0 0 24 24" class="fill"><path d="M7 4v16l13-8z"/></svg>`,
   check: html`<svg viewBox="0 0 24 24" class="verified"><circle cx="12" cy="12" r="10"/><path d="m8 12.5 2.6 2.5L16 9.5"/></svg>`,
@@ -356,7 +357,7 @@ function Unlock({ done }) {
     setBusy(false);
   }
   return html`<div class="gate">
-    <div class="logo">${I.lock}</div>
+    <div class="logo">${I.camera}</div>
     <h1>Quiet Instagram</h1>
     <p class="muted">Search, follow, message. Nothing to scroll.</p>
     <form onSubmit=${submit}>
@@ -408,7 +409,7 @@ function Connect({ done }) {
     kind === "2fa" ? "your authenticator app or texts" : kind.includes("mail") ? "your email" : kind.includes("sms") || kind.includes("phone") ? "your phone" : "your email or phone";
 
   return html`<div class="gate">
-    <div class="logo">${I.lock}</div>
+    <div class="logo">${I.camera}</div>
     <h1>Connect Instagram</h1>
     ${step === "login"
       ? html`<form onSubmit=${login}>

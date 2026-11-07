@@ -1,7 +1,7 @@
 // Serve the app shell from cache so it opens instantly, even on bad signal.
 // Updates download in the background and apply on the next launch.
 // Instagram data (/api) never goes through here.
-const VERSION = "v1";
+const VERSION = "v2";
 const SHELL = ["/", "/static/app.js", "/static/style.css", "/static/vendor/preact-htm.js", "/static/manifest.json", "/static/icon-180.png"];
 
 self.addEventListener("install", (e) => {
