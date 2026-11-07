@@ -335,6 +335,7 @@ class LoginFlow:
     """
 
     WAIT = 90  # seconds an HTTP request waits for the login thread to say something
+    BACKOFF = dt.timedelta(minutes=60)  # after Instagram rate-limits a login, don't try again for this long
 
     def __init__(self, ig: IG):
         self.ig = ig
@@ -388,6 +389,13 @@ class LoginFlow:
             self._events.put(("ok", info.username))
         except TwoFactorRequired:
             self._events.put(("2fa", cl))
+        except (PleaseWaitFewMinutes, RateLimitError, ClientThrottledError):
+            # Hammering the login endpoint is the fastest way to get flagged.
+            self._creds = None
+            s = self.ig._state()
+            s["login_blocked_until"] = (dt.datetime.now() + self.BACKOFF).isoformat(timespec="seconds")
+            write_private_json(STATE_FILE, s)
+            self._events.put(("error", self._blocked_message()))
         except Exception as e:  # report anything else to the phone verbatim
             self._creds = None
             self._events.put(("error", f"{type(e).__name__}: {e}"))
@@ -406,8 +414,23 @@ class LoginFlow:
             return {"status": "need_code", "kind": value}
         return {"status": "error", "message": value}
 
+    def _blocked_message(self) -> str | None:
+        until = self.ig._state().get("login_blocked_until")
+        if not until:
+            return None
+        left = dt.datetime.fromisoformat(until) - dt.datetime.now()
+        if left.total_seconds() <= 0:
+            return None
+        minutes = max(1, round(left.total_seconds() / 60))
+        return (
+            "Instagram is limiting new logins from this server, so it's pausing to protect your account. "
+            f"Try again in about {minutes} min, just once."
+        )
+
     def start(self, username: str, password: str, code: str, tz_name: str, locale: str) -> dict:
         with self.lock:
+            if blocked := self._blocked_message():
+                return {"status": "error", "message": blocked}
             self._events, self._codes = queue.Queue(), queue.Queue()
             username = username.strip().lstrip("@")
             self._creds = (username, password)
@@ -435,6 +458,8 @@ class LoginFlow:
     def with_sessionid(self, sessionid: str, tz_name: str, locale: str) -> dict:
         """Fallback only: a browser session on an emulated phone is less sturdy."""
         with self.lock:
+            if blocked := self._blocked_message():
+                return {"status": "error", "message": blocked}
             cl = self._new_client("", tz_name, locale)
             try:
                 cl.login_by_sessionid(sessionid.strip())
