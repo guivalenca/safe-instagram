@@ -214,6 +214,9 @@ const I = {
   x: html`<svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg>`,
   comment: html`<svg viewBox="0 0 24 24"><path d="M20.7 16.4A9 9 0 1 0 17 20l4 1z"/></svg>`,
   bookmark: html`<svg viewBox="0 0 24 24"><path d="M19 21 12 16 5 21V4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1z"/></svg>`,
+  requests: html`<svg viewBox="0 0 24 24"><circle cx="10" cy="8" r="4"/><path d="M2.5 20a7.5 7.5 0 0 1 15 0"/><path d="M19.5 8v6M16.5 11h6"/></svg>`,
+  grid: html`<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>`,
+  plusPlain: html`<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>`,
   sun: html`<svg viewBox="0 0 24 24"><path d="M3 18h18M6.5 18a5.5 5.5 0 0 1 11 0"/><path d="M12 7V4M5.2 10.2 3.6 8.6M18.8 10.2l1.6-1.6"/></svg>`,
   lock: html`<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>`,
   camera: html`<svg viewBox="0 0 24 24"><rect x="3.96" y="3.96" width="16.08" height="16.08" rx="4.32"/><circle cx="12" cy="12" r="3.7"/><circle cx="16.51" cy="7.44" r="1.03" class="dot"/></svg>`,
@@ -552,7 +555,7 @@ function Profile({ username }) {
   return html`<div class="page">
     <${TopBar}
       title=${html`<${Name} u=${u} />`}
-      left=${p?.me ? html`<${Link} href="/new" class="icon" aria-label="New post">${I.plus}<//>` : undefined}
+      left=${p?.me ? html`<${Link} href="/requests" class="icon" aria-label="Follow requests">${I.requests}<//>` : undefined}
       right=${p?.me && html`<${Link} href="/settings" class="icon">${I.gear}<//>`}
     />
     ${ptr}
@@ -571,15 +574,15 @@ function Profile({ username }) {
       ${p?.rel?.followed_by && html`<small class="muted">Follows you</small>`}
     </section>
     ${p && !p.me && html`<${ProfileActions} p=${p} k=${key} onUnfollow=${() => setSheet(true)} />`}
-    ${p?.me && p.private && html`<${RequestsRow} />`}
     ${!p && html`<div class="actions"><button class="btn ghost" disabled>…</button></div>`}
     ${id && (p?.can_see ?? !u.private) && html`<${Highlights} userId=${id} username=${u.username} />`}
+    <div class="grid-tabs"><span>${I.grid}</span></div>
     ${p && !p.can_see
       ? html`<${Empty}><div class="big-icon">${I.lock}</div><b>This account is private</b><p class="muted">Follow to see their photos.</p><//>`
-      : p && p.posts === 0
+      : p && p.posts === 0 && !p.me
       ? html`<${Empty}><p class="muted">No posts yet.</p><//>`
       : id && (p?.can_see ?? !u.private)
-      ? html`<${Grid} userId=${id} />`
+      ? html`<${Grid} userId=${id} mine=${!!p?.me} empty=${p?.posts === 0} />`
       : null}
     ${sheet &&
     html`<${Sheet} onClose=${() => setSheet(false)}>
@@ -596,19 +599,6 @@ function Profile({ username }) {
       <button class="btn secondary" onClick=${() => setSheet(false)}>Cancel</button>
     <//>`}
   </div>`;
-}
-
-function RequestsRow() {
-  const { data } = useQuery("/api/requests", 30000);
-  if (!data?.length) return null;
-  return html`<${Link} href="/requests" class="requests-row">
-    <span class=${`avatars n${Math.min(data.length, 2)}`}>${data.slice(0, 2).map((u) => html`<${Avatar} src=${u.pic} size=${data.length > 1 ? 30 : 40} />`)}</span>
-    <span class="row-text">
-      <b>Follow requests</b>
-      <small class="muted">${data[0].username}${data.length > 1 ? ` and ${data.length - 1} other${data.length > 2 ? "s" : ""}` : ""}</small>
-    </span>
-    <span class="count">${data.length >= 50 ? "50+" : data.length}</span>
-  <//>`;
 }
 
 function Requests() {
@@ -739,7 +729,7 @@ function ProfileActions({ p, k, onUnfollow }) {
   </div>`;
 }
 
-function Grid({ userId }) {
+function Grid({ userId, mine = false, empty = false }) {
   const [cursors, setCursors] = useState(() => gridPages.get(userId) || [""]);
   const more = (next) => {
     const list = [...cursors, next];
@@ -747,7 +737,12 @@ function Grid({ userId }) {
     setCursors(list);
   };
   return html`<div class="grid">
-    ${cursors.map((c, i) => html`<${GridPage} key=${c} userId=${userId} cursor=${c} last=${i === cursors.length - 1} more=${more} />`)}
+    ${mine &&
+    html`<${Link} href="/new" class="tile new-tile" aria-label="New post">
+      <span class="new-plus">${I.plusPlain}</span>
+      <small>New post</small>
+    <//>`}
+    ${!empty && cursors.map((c, i) => html`<${GridPage} key=${c} userId=${userId} cursor=${c} last=${i === cursors.length - 1} more=${more} />`)}
   </div>`;
 }
 
