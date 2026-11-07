@@ -1,0 +1,554 @@
+"""safe-instagram: Instagram without the feed.
+
+A small JSON API for the phone app in static/. There is deliberately no
+endpoint for the home feed, Reels, Explore, the Stories tray, suggestions or
+notifications, and no setting to turn them on. To get them back you'd have to
+write the code.
+"""
+
+import hmac
+import os
+import re
+import secrets
+import tempfile
+import time
+from pathlib import Path
+
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from instagrapi.exceptions import (
+    BadPassword,
+    ClientError,
+    ClientThrottledError,
+    FeedbackRequired,
+    NotFoundError,
+    PleaseWaitFewMinutes,
+    PrivateAccount,
+    RateLimitError,
+)
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
+from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+
+from ig import (
+    DATA,
+    IG,
+    CoolingDown,
+    DailyLimit,
+    LoginFlow,
+    NotConnected,
+    SessionExpired,
+    read_json,
+    write_private_json,
+)
+
+register_heif_opener()
+
+HERE = Path(__file__).parent
+STATIC = HERE / "static"
+PAGE_SIZE = 12  # posts per page on a profile; there is no infinite scroll
+
+PASSCODE = os.environ.get("APP_PASSCODE", "")
+if len(PASSCODE) < 6:
+    raise SystemExit("Set APP_PASSCODE (at least 6 characters) - it's what unlocks the app.")
+
+
+def secret_key() -> str:
+    if os.environ.get("SECRET_KEY"):
+        return os.environ["SECRET_KEY"]
+    path = DATA / "secret.json"
+    key = read_json(path).get("key")
+    if not key:
+        key = secrets.token_hex(32)
+        write_private_json(path, {"key": key})
+    return key
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+ig = IG()
+login_flow = LoginFlow(ig)
+
+
+# -- unlocking the app ------------------------------------------------------
+
+OPEN_PATHS = ("/api/unlock", "/api/status")
+failures = []  # timestamps of wrong passcodes
+
+
+@app.middleware("http")
+async def require_unlock(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and not path.startswith(OPEN_PATHS) and not request.session.get("unlocked"):
+        return JSONResponse({"error": "locked"}, status_code=401)
+    return await call_next(request)
+
+
+# Added after require_unlock so it wraps it (the last middleware added runs first).
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=secret_key(),
+    max_age=60 * 60 * 24 * 180,
+    same_site="strict",
+    https_only=bool(os.environ.get("RAILWAY_ENVIRONMENT")),
+)
+
+
+class Passcode(BaseModel):
+    passcode: str
+
+
+@app.post("/api/unlock")
+def unlock(request: Request, body: Passcode):
+    now = time.time()
+    failures[:] = [t for t in failures if now - t < 15 * 60]
+    if len(failures) >= 8:
+        return JSONResponse({"error": "too_many", "message": "Too many tries. Wait 15 minutes."}, status_code=429)
+    if hmac.compare_digest(body.passcode.encode(), PASSCODE.encode()):
+        request.session["unlocked"] = True
+        return {"ok": True}
+    failures.append(now)
+    time.sleep(1)
+    return JSONResponse({"error": "wrong", "message": "Wrong passcode."}, status_code=401)
+
+
+@app.post("/api/lock")
+def lock(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+
+@app.get("/api/status")
+def status(request: Request):
+    unlocked = bool(request.session.get("unlocked"))
+    connected = unlocked and ig.connected()
+    return {
+        "unlocked": unlocked,
+        "connected": connected,
+        "username": ig.username if connected else None,
+        "user_id": ig.user_id if connected else None,
+        "cooldown": ig.cooldown() if unlocked else None,
+    }
+
+
+# -- connecting Instagram ----------------------------------------------------
+
+
+class Login(BaseModel):
+    username: str = ""
+    password: str = ""
+    sessionid: str = ""
+    timezone_offset: int = 0
+    locale: str = ""
+
+
+class Code(BaseModel):
+    code: str
+
+
+@app.post("/api/connect")
+def connect(body: Login):
+    if body.sessionid:
+        return login_flow.with_sessionid(body.sessionid, body.timezone_offset, body.locale)
+    return login_flow.start(body.username, body.password, body.timezone_offset, body.locale)
+
+
+@app.post("/api/connect/code")
+def connect_code(body: Code):
+    return login_flow.submit_code(body.code)
+
+
+@app.post("/api/disconnect")
+def disconnect():
+    ig.disconnect()
+    return {"ok": True}
+
+
+# -- errors ------------------------------------------------------------------
+
+
+def err(status: int, error: str, message: str, **extra):
+    return JSONResponse({"error": error, "message": message, **extra}, status_code=status)
+
+
+@app.exception_handler(NotConnected)
+def not_connected(request, exc):
+    return err(409, "not_connected", "Connect your Instagram account.")
+
+
+@app.exception_handler(SessionExpired)
+def session_expired(request, exc):
+    return err(409, "not_connected", "Instagram ended the session. Log in again.")
+
+
+@app.exception_handler(CoolingDown)
+def cooling_down(request, exc: CoolingDown):
+    return err(
+        429,
+        "cooldown",
+        f"{exc.reason}. Pausing until {exc.until:%H:%M} so your account stays safe.",
+        until=exc.until.isoformat(),
+    )
+
+
+@app.exception_handler(DailyLimit)
+def daily_limit(request, exc):
+    return err(429, "daily_limit", "That's today's limit for follows and likes. It resets at midnight.")
+
+
+@app.exception_handler(ClientError)
+def instagram_error(request, exc: ClientError):
+    if isinstance(exc, NotFoundError):
+        return err(404, "not_found", "That doesn't exist anymore.")
+    if isinstance(exc, PrivateAccount):
+        return err(403, "private", "This account is private.")
+    if isinstance(exc, (FeedbackRequired, PleaseWaitFewMinutes, RateLimitError, ClientThrottledError)):
+        return err(429, "cooldown", "Instagram asked us to slow down. Pausing for a while.")
+    if isinstance(exc, BadPassword):
+        return err(400, "bad_password", "Wrong password.")
+    return err(502, "instagram", str(exc) or type(exc).__name__)
+
+
+# -- turning Instagram objects into small JSON --------------------------------
+
+
+def s(v):
+    return str(v) if v else None
+
+
+def user_short(u):
+    return {
+        "id": str(u.pk),
+        "username": u.username,
+        "name": u.full_name or "",
+        "pic": s(u.profile_pic_url),
+        "verified": bool(u.is_verified),
+        "private": bool(u.is_private),
+    }
+
+
+def small_image(m):
+    """Grid-sized image (~320-640px) instead of the full 1080px one."""
+    versions = getattr(m, "image_versions2", None)
+    cands = [c for c in (versions.candidates if versions else []) if getattr(c, "width", 0)]
+    if cands:
+        fit = sorted((c for c in cands if c.width >= 320), key=lambda c: c.width)
+        return s((fit or sorted(cands, key=lambda c: -c.width))[0].url)
+    if m.thumbnail_url:
+        return s(m.thumbnail_url)
+    if getattr(m, "resources", None):
+        return s(m.resources[0].thumbnail_url)
+    return None
+
+
+def media_tile(m):
+    return {"id": str(m.pk), "thumb": small_image(m), "type": m.media_type}
+
+
+def media_full(m):
+    if m.media_type == 8:
+        items = [{"type": r.media_type, "img": s(r.thumbnail_url), "video": s(r.video_url)} for r in m.resources]
+    else:
+        items = [{"type": m.media_type, "img": s(m.thumbnail_url), "video": s(m.video_url)}]
+    dims = m.dimensions
+    return {
+        "id": str(m.pk),
+        "media_id": m.id,
+        "code": m.code,
+        "user": user_short(m.user),
+        "caption": m.caption_text or "",
+        "taken_at": m.taken_at.isoformat(),
+        "liked": bool(m.has_liked),
+        "likes": None if m.like_and_view_counts_disabled else m.like_count,
+        "comments": m.comment_count or 0,
+        "ratio": (dims.width / dims.height) if dims and dims.width and dims.height else None,
+        "items": items,
+    }
+
+
+def story_json(st):
+    return {
+        "id": str(st.pk),
+        "type": st.media_type,
+        "img": s(st.thumbnail_url),
+        "video": s(st.video_url),
+        "duration": st.video_duration or 0,
+        "taken_at": st.taken_at.isoformat(),
+    }
+
+
+CODE_RE = re.compile(r"instagram\.com/(?:[\w.]+/)?(?:p|reel|reels|tv)/([\w-]+)")
+
+
+def code_from(url) -> str | None:
+    m = CODE_RE.search(str(url or ""))
+    return m.group(1) if m else None
+
+
+def shared_media(m, label):
+    return {"label": label, "user": m.user.username if m.user else "", "img": small_image(m), "media": str(m.pk)}
+
+
+def message_json(m, my_id):
+    out = {
+        "id": m.id,
+        "mine": bool(m.is_sent_by_viewer) or str(m.user_id) == my_id,
+        "user_id": str(m.user_id) if m.user_id else None,
+        "t": m.timestamp.isoformat(),
+        "kind": m.item_type or "unknown",
+        "text": None,
+    }
+    if m.item_type == "text":
+        out["text"] = m.text
+    elif m.item_type == "link":
+        out["text"] = m.link.text if m.link else m.text
+    elif m.item_type == "like":
+        out["text"] = "❤️"
+    elif m.media_share:
+        out["share"] = shared_media(m.media_share, "Post")
+    elif m.clip:
+        out["share"] = shared_media(m.clip, "Reel")
+    elif m.xma_share or m.generic_xma:
+        x = m.xma_share or m.generic_xma[0]
+        out["share"] = {
+            "label": x.header_title_text or x.title or "Shared post",
+            "img": x.preview_url,
+            "code": code_from(x.video_url),
+        }
+    elif m.media:
+        out["media"] = {"img": s(m.media.thumbnail_url), "video": s(m.media.video_url), "audio": s(m.media.audio_url)}
+    elif m.story_share:
+        out["note"] = "Shared a story"
+        out["text"] = m.story_share.get("message") or None
+    elif m.reel_share:
+        out["note"] = "Replied to a story"
+        out["text"] = m.reel_share.get("text") or None
+    elif m.placeholder:
+        out["note"] = m.placeholder.get("message") or "Unavailable"
+    else:
+        out["text"] = m.text
+        if not m.text:
+            out["note"] = (m.item_type or "message").replace("_", " ")
+    return out
+
+
+def thread_json(t, my_id):
+    last = max(t.messages, key=lambda m: m.timestamp) if t.messages else None
+    return {
+        "id": t.id,
+        "title": t.thread_title or ", ".join(u.username for u in t.users),
+        "users": [user_short(u) for u in t.users],
+        "group": t.is_group,
+        "pending": t.pending,
+        "unread": not t.is_seen(my_id),
+        "at": t.last_activity_at.isoformat(),
+        "last": message_json(last, my_id) if last else None,
+    }
+
+
+# -- search & profiles -------------------------------------------------------
+
+
+@app.get("/api/search")
+def search(q: str = ""):
+    q = q.strip().lstrip("@")
+    if not q:
+        return []
+    users = ig.cached(f"search:{q.lower()}", 300, lambda cl: cl.search_users(q))
+    return [user_short(u) for u in users[:25]]
+
+
+@app.get("/api/u/{username}")
+def profile(username: str):
+    u = ig.cached(f"user:{username.lower()}", 120, lambda cl: cl.user_info_by_username_v1(username))
+    me = str(u.pk) == ig.user_id
+    rel = None if me else ig.cached(f"rel:{u.pk}", 60, lambda cl: cl.user_friendship_v1(u.pk))
+    return {
+        **user_short(u),
+        "pic_hd": s(u.profile_pic_url_hd) or s(u.profile_pic_url),
+        "bio": u.biography or "",
+        "url": u.external_url,
+        "posts": u.media_count,
+        "followers": u.follower_count,
+        "following": u.following_count,
+        "me": me,
+        "rel": None
+        if me
+        else {
+            "following": rel.following,
+            "followed_by": rel.followed_by,
+            "requested": rel.outgoing_request,
+        },
+        "can_see": me or not u.is_private or rel.following,
+    }
+
+
+@app.get("/api/u/{user_id}/posts")
+def posts(user_id: str, cursor: str = ""):
+    medias, next_cursor = ig.cached(
+        f"posts:{user_id}:{cursor}",
+        300,
+        lambda cl: cl.user_medias_paginated_v1(user_id, PAGE_SIZE, end_cursor=cursor),
+    )
+    return {"items": [media_tile(m) for m in medias], "next": next_cursor or None}
+
+
+@app.get("/api/u/{user_id}/stories")
+def stories(user_id: str):
+    items = ig.cached(f"stories:{user_id}", 120, lambda cl: cl.user_stories_v1(user_id))
+    return [story_json(st) for st in sorted(items, key=lambda st: st.taken_at)]
+
+
+class Ids(BaseModel):
+    ids: list[str]
+
+
+@app.post("/api/stories/seen")
+def stories_seen(body: Ids):
+    if body.ids:
+        ig.run(lambda cl: cl.story_seen([int(i) for i in body.ids]))
+    return {"ok": True}
+
+
+class Follow(BaseModel):
+    follow: bool
+
+
+@app.post("/api/u/{user_id}/follow")
+def follow(user_id: str, body: Follow):
+    if body.follow:
+        ig.run(lambda cl: cl.user_follow(user_id), write=True, counts=True)
+    else:
+        ig.run(lambda cl: cl.user_unfollow(user_id), write=True, counts=True)
+    ig.forget(f"rel:{user_id}", "user:")
+    rel = ig.run(lambda cl: cl.user_friendship_v1(user_id))
+    return {"following": rel.following, "followed_by": rel.followed_by, "requested": rel.outgoing_request}
+
+
+# -- single posts ------------------------------------------------------------
+
+
+@app.get("/api/p/{media_pk}")
+def post(media_pk: str):
+    return media_full(ig.cached(f"media:{media_pk}", 120, lambda cl: cl.media_info_v1(media_pk)))
+
+
+@app.get("/api/c/{code}")
+def post_by_code(code: str):
+    """Shared links (instagram.com/p/CODE, /reel/CODE) -> a media id."""
+    return {"id": str(ig.cached(f"code:{code}", 86400, lambda cl: cl.media_pk_from_code(code)))}
+
+
+class Like(BaseModel):
+    media_id: str
+    like: bool
+
+
+@app.post("/api/p/{media_pk}/like")
+def like(media_pk: str, body: Like):
+    ig.run(lambda cl: cl.media_like(body.media_id, revert=not body.like), write=True, counts=True)
+    ig.forget(f"media:{media_pk}")
+    return {"liked": body.like}
+
+
+# -- direct messages ---------------------------------------------------------
+
+
+@app.get("/api/dm")
+def inbox(requests: bool = False):
+    my_id = ig.user_id
+    if requests:
+        threads = ig.cached("inbox:requests", 10, lambda cl: cl.direct_pending_inbox(20))
+    else:
+        threads = ig.cached("inbox:main", 10, lambda cl: cl.direct_threads(25))
+    return [thread_json(t, my_id) for t in threads]
+
+
+@app.get("/api/dm/{thread_id}")
+def thread(thread_id: str, n: int = 30):
+    n = max(10, min(n, 200))
+    my_id = ig.user_id
+    t = ig.cached(f"thread:{thread_id}:{n}", 4, lambda cl: cl.direct_thread(int(thread_id), amount=n))
+    messages = sorted(t.messages, key=lambda m: m.timestamp)
+    if messages and not messages[-1].is_sent_by_viewer and not t.pending and not t.is_seen(my_id):
+        ig.run(lambda cl: cl.direct_send_seen(int(thread_id)))
+        ig.forget("inbox:")
+    return {**thread_json(t, my_id), "messages": [message_json(m, my_id) for m in messages], "n": n}
+
+
+class Send(BaseModel):
+    text: str
+    accept: bool = False
+
+
+@app.post("/api/dm/{thread_id}/send")
+def send(thread_id: str, body: Send):
+    if body.accept:
+        ig.run(lambda cl: cl.direct_pending_approve(int(thread_id)), write=True)
+    msg = ig.run(lambda cl: cl.direct_send(body.text.strip(), thread_ids=[int(thread_id)]), write=True)
+    ig.forget(f"thread:{thread_id}:", "inbox:")
+    return message_json(msg, ig.user_id)
+
+
+@app.post("/api/dm/to/{user_id}")
+def send_to_user(user_id: str, body: Send):
+    msg = ig.run(lambda cl: cl.direct_send(body.text.strip(), user_ids=[int(user_id)]), write=True)
+    ig.forget("inbox:")
+    return {"thread_id": str(msg.thread_id) if msg.thread_id else None}
+
+
+# -- posting -----------------------------------------------------------------
+
+
+def prepare_photo(upload: UploadFile, for_story: bool) -> Path:
+    img = Image.open(upload.file)
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    if not for_story:
+        # Feed photos must be between 4:5 (portrait) and 1.91:1 (landscape).
+        w, h = img.size
+        if w / h < 0.8:
+            new_h = int(w / 0.8)
+            top = (h - new_h) // 2
+            img = img.crop((0, top, w, top + new_h))
+        elif w / h > 1.91:
+            new_w = int(h * 1.91)
+            left = (w - new_w) // 2
+            img = img.crop((left, 0, left + new_w, h))
+    img.thumbnail((1440, 2560 if for_story else 1800))
+    fd, name = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    img.save(name, "JPEG", quality=92)
+    return Path(name)
+
+
+@app.post("/api/post")
+def new_post(photo: UploadFile = File(...), caption: str = Form(""), where: str = Form("feed")):
+    for_story = where == "story"
+    path = prepare_photo(photo, for_story)
+    try:
+        if for_story:
+            ig.run(lambda cl: cl.photo_upload_to_story(path), write=True)
+        else:
+            ig.run(lambda cl: cl.photo_upload(path, caption), write=True)
+    finally:
+        path.unlink(missing_ok=True)
+    ig.forget("posts:", "stories:", "user:")
+    return {"ok": True}
+
+
+# -- the phone app -------------------------------------------------------------
+
+app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(STATIC / "sw.js", media_type="text/javascript", headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/{path:path}")
+def spa(path: str):
+    if path.startswith("api/"):
+        return err(404, "not_found", "No such endpoint.")
+    return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
