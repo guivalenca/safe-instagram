@@ -39,6 +39,9 @@
 html {
   background: var(--bg);
   -webkit-text-size-adjust: 100%;
+  /* Safari scrolls the page on <html>: without this its rubber-band bounce drags
+     the whole screen, header included, along with our own pull-to-refresh. */
+  overscroll-behavior-y: none;
 }
 
 body {
@@ -847,9 +850,7 @@ img.loaded,
 }
 .story-head span {
   opacity: 0.7;
-}
-.story-head .icon {
-  margin-left: auto;
+  margin-right: auto; /* the buttons sit at the right */
 }
 .story-media {
   position: absolute;

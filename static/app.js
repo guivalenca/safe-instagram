@@ -221,6 +221,8 @@ const I = {
   camera: html`<svg viewBox="0 0 24 24"><rect x="3.96" y="3.96" width="16.08" height="16.08" rx="4.32"/><circle cx="12" cy="12" r="3.7"/><circle cx="16.51" cy="7.44" r="1.03" class="dot"/></svg>`,
   album: html`<svg viewBox="0 0 24 24" class="fill"><path d="M7 3h12a2 2 0 0 1 2 2v12h-2V5H7z"/><rect x="3" y="7" width="14" height="14" rx="2"/></svg>`,
   play: html`<svg viewBox="0 0 24 24" class="fill"><path d="M7 4v16l13-8z"/></svg>`,
+  sound: html`<svg viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M15.5 9a4 4 0 0 1 0 6M18 6.5a7.5 7.5 0 0 1 0 11"/></svg>`,
+  muted: html`<svg viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13l-4.5-4H4z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></svg>`,
   check: html`<svg viewBox="0 0 24 24" class="verified"><circle cx="12" cy="12" r="10"/><path d="m8 12.5 2.6 2.5L16 9.5"/></svg>`,
 };
 
@@ -1091,6 +1093,9 @@ function CodeRedirect({ code }) {
    Stories: one person at a time. When theirs end, you're back on their profile.
    ========================================================================== */
 
+// Stories' sound stays the way you left it.
+const STORY_MUTED_KEY = "stories-muted";
+
 function Stories({ username, highlight, user, onClose }) {
   const profQ = useQuery(user ? null : `/api/u/${encodeURIComponent(username)}`, 60000).data;
   const prof = user || profQ || peeks.users.get(username.toLowerCase());
@@ -1104,6 +1109,13 @@ function Stories({ username, highlight, user, onClose }) {
   const [progress, setProgress] = useState(0);
   const [drag, setDrag] = useState(0);
   const [liked, setLiked] = useState({});
+  const [muted, setMuted] = useState(() => localStorage.getItem(STORY_MUTED_KEY) === "1");
+  const toggleSound = () => {
+    const on = !muted;
+    localStorage.setItem(STORY_MUTED_KEY, on ? "1" : "0");
+    if (video.current) video.current.muted = on;
+    setMuted(on);
+  };
   const isLiked = (st) => liked[st.id] ?? !!st.liked;
   const reachedEnd = useRef(false);
   const [replying, setReplying] = useState(false);
@@ -1236,6 +1248,7 @@ function Stories({ username, highlight, user, onClose }) {
           <div class="story-head">
             <${Avatar} src=${prof?.pic} size=${32} />
             <b>${highlight ? q.data?.title || username : username}</b><span>${highlight ? username : ago(cur.taken_at)}</span>
+            ${cur.video && html`<button class="icon" aria-label=${muted ? "Turn sound on" : "Mute"} onClick=${toggleSound}>${muted ? I.muted : I.sound}</button>`}
             <button class="icon" onClick=${close}>${I.x}</button>
           </div>
           <div class="story-media" onPointerDown=${onDown} onPointerMove=${onMove} onPointerUp=${onUp} onPointerCancel=${onUp}>
@@ -1247,6 +1260,7 @@ function Stories({ username, highlight, user, onClose }) {
                   poster=${cur.img}
                   playsinline
                   autoplay
+                  muted=${muted}
                   onLoadedData=${() => setArrived(cur.id)}
                   onPlaying=${() => setArrived(cur.id)}
                   onTimeUpdate=${(e) => e.target.duration && setProgress(e.target.currentTime / e.target.duration)}

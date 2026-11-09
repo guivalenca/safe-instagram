@@ -708,7 +708,7 @@ def image(u: str):
 # -- today: posts and stories from people you follow, 5 minutes once a day -----
 
 DAILY_MINUTES = 8
-DAILY_TIMER = False  # off for now while Today is being tuned; True brings back the once-a-day minutes
+DAILY_TIMER = True  # False keeps Today open all day with no countdown (handy while tuning it)
 DAILY_MAX_AGE = dt.timedelta(days=7)  # older posts are skipped
 
 
