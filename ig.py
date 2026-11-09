@@ -94,7 +94,7 @@ class DailyLimit(Exception):
 def write_private_json(path: Path, data: dict):
     """Atomically write a JSON file only this user can read (it holds session cookies)."""
     DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    tmp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")  # one per thread: two writers mustn't share it
     with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
         json.dump(data, f, indent=2, default=str)
     os.replace(tmp, path)

@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import tempfile
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -219,6 +220,7 @@ def instagram_error(request, exc: ClientError):
         return err(429, "cooldown", "Instagram asked us to slow down. Pausing for a while.")
     if isinstance(exc, BadPassword):
         return err(400, "bad_password", "Wrong password.")
+    log.warning("instagram error on %s: %s: %s", request.url.path, type(exc).__name__, str(exc)[:200])
     return err(502, "instagram", str(exc) or type(exc).__name__)
 
 
@@ -647,20 +649,65 @@ def feed_verdict(media: dict) -> str:
     return "keep" if fs.get("following") else "not_following"
 
 
-def daily_page(day: str, cursor: str):
-    """One timeline page, filtered. Instagram sends ~5 posts a page, often 3 of them suggestions."""
+def timeline_page(cl, max_id, source):
+    """One feed/timeline request.
 
-    def fetch(cl):  # with a cursor, instagrapi switches the reason to "pagination"
-        return cl.get_timeline_feed("cold_start_fetch", max_id=cursor or None)
+    instagrapi always paginates with pagination_source=feed_recs, which is the
+    "Suggested posts" list; "Older posts" (what you've already seen) needs its own
+    source. It also reports every post it has fetched as fully viewed, which takes
+    them out of your feed in the official app too, so send no views.
+    """
+    if source and source != "feed_recs":
+        send = cl.private_request
 
-    raw = ig.cached(f"daily:feed:{day}:{cursor}", 600, fetch)
+        def private_request(endpoint, data=None, *args, **kwargs):
+            if endpoint == "feed/timeline/":
+                data = json.dumps({**json.loads(data), "pagination_source": source})
+            return send(endpoint, data, *args, **kwargs)
+
+        cl.private_request = private_request
+    try:  # with a max_id, instagrapi switches the reason to "pagination"
+        return cl.get_timeline_feed("cold_start_fetch", max_id=max_id, seen_posts=[])
+    finally:
+        cl.__dict__.pop("private_request", None)
+
+
+def page_medias(raw: dict, tally: Counter):
+    """The posts in a timeline page, and the cursor for "Older posts" if it offers one.
+
+    Past "You're all caught up", Instagram nests the posts you've already seen
+    in a group of the end-of-feed module instead of the main list.
+    """
+    medias, past = [], None
+    for it in raw.get("feed_items") or []:
+        if it.get("media_or_ad"):
+            medias.append(it["media_or_ad"])
+            continue
+        tally.update(f"module:{k}" for k in it)
+        groups = ((it.get("end_of_feed_demarcator") or {}).get("group_set") or {}).get("groups") or []
+        for g in groups:
+            tally[f"group:{g.get('id')}"] += 1
+            if g.get("id") != "past_posts":
+                continue
+            for x in g.get("feed_items") or []:
+                media = x.get("media_or_ad") or (x if x.get("media_type") else None)
+                if media:
+                    tally["past_posts"] += 1
+                    medias.append(media)
+            if g.get("next_max_id"):
+                past = (g["next_max_id"], g.get("pagination_source") or "past_posts")
+    return medias, past
+
+
+def daily_page(day: str, cursor: tuple | None):
+    """One timeline page, filtered, and where to go next. Instagram sends ~5 posts a page."""
+    max_id, source = cursor or (None, None)
+    # Later pages are extras: a refusal there shouldn't count as trouble.
+    raw = ig.cached(f"daily:feed:{day}:{source}:{max_id}", 600, timeline_page, max_id, source, soft=bool(cursor))
     cutoff = dt.datetime.now(dt.timezone.utc) - DAILY_MAX_AGE
     items, tally = [], Counter()
-    for it in raw.get("feed_items") or []:
-        media = it.get("media_or_ad")
-        if not media:
-            tally["other_module"] += 1
-            continue
+    medias, past = page_medias(raw, tally)
+    for media in medias:
         verdict = feed_verdict(media)
         tally[verdict] += 1
         if not verdict.startswith("keep"):
@@ -676,20 +723,24 @@ def daily_page(day: str, cursor: str):
             tally["too_old"] += 1
             continue
         items.append(m)
+    # Once Instagram offers older posts from people you follow, follow those
+    # rather than the main list, which carries on into suggestions.
     more = raw.get("more_available") and raw.get("next_max_id")
-    return items, more or None, tally
+    return items, past or ((more, source or "feed_recs") if more else None), tally
 
 
 POOL_FILE = DATA / "daily_pool.json"
+POOL_LOCK = threading.Lock()  # the feed and likes/saves both rewrite the pool
 SCAN_MAX_PAGES = 8
 
 
 def pool_update(media_pk: str, **fields):
     """Keep likes/saves made from Today in the stored copy."""
-    pool = read_json(POOL_FILE)
-    if media_pk in pool:
-        pool[media_pk]["m"].update(fields)
-        write_private_json(POOL_FILE, pool)
+    with POOL_LOCK:
+        pool = read_json(POOL_FILE)
+        if media_pk in pool:
+            pool[media_pk]["m"].update(fields)
+            write_private_json(POOL_FILE, pool)
 
 
 @app.get("/api/daily/feed")
@@ -703,9 +754,15 @@ def daily_feed():
     """
     require_daily_open()
     day = local_now().date().isoformat()
-    found, tally, cursor, pages, dry = {}, Counter(), "", 0, 0
+    found, tally, cursor, pages, dry = {}, Counter(), None, 0, 0
     while pages < SCAN_MAX_PAGES:
-        page, cursor, t = daily_page(day, cursor)
+        try:
+            page, cursor, t = daily_page(day, cursor)
+        except ClientError as e:
+            if not pages:
+                raise
+            tally[f"failed:{type(e).__name__}"] += 1
+            break
         pages += 1
         tally.update(t)
         new = [m for m in page if m["id"] not in found]
@@ -717,11 +774,12 @@ def daily_feed():
 
     now = dt.datetime.now(dt.timezone.utc)
     cutoff = now - DAILY_MAX_AGE
-    pool = {k: v for k, v in read_json(POOL_FILE).items() if dt.datetime.fromisoformat(v["m"]["taken_at"]) >= cutoff}
-    for pk, m in found.items():
-        first = pool.get(pk, {}).get("first_seen", now.isoformat())
-        pool[pk] = {"m": m, "first_seen": first}
-    write_private_json(POOL_FILE, pool)
+    with POOL_LOCK:
+        pool = {k: v for k, v in read_json(POOL_FILE).items() if dt.datetime.fromisoformat(v["m"]["taken_at"]) >= cutoff}
+        for pk, m in found.items():
+            first = pool.get(pk, {}).get("first_seen", now.isoformat())
+            pool[pk] = {"m": m, "first_seen": first}
+        write_private_json(POOL_FILE, pool)
 
     items = sorted((v["m"] for v in pool.values()), key=lambda m: m["taken_at"], reverse=True)
     # Counts only, no content: lets us tune this from the logs.
@@ -766,7 +824,11 @@ def daily_stories():
     rest = [r for r in raw.get("remaining_reel_ids_to_fetch") or [] if str(r).isdigit()][:100]
     for i in range(0, len(rest), 50):
         chunk = rest[i : i + 50]
-        reels += ig.cached(f"daily:reels:{day}:{i}", 600, reels_media, chunk, soft=True)
+        try:  # an extra: if it fails, still show the new ones
+            reels += ig.cached(f"daily:reels:{day}:{i}", 600, reels_media, chunk, soft=True)
+        except ClientError as e:
+            log.warning("daily tray: reels_media failed: %s: %s", type(e).__name__, str(e)[:200])
+            break
     out, seen_ids = [], set()
     for reel in reels:
         e = tray_entry(reel)
