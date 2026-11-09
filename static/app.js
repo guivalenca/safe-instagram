@@ -1256,17 +1256,15 @@ function Countdown({ deadline, onEnd }) {
 let todayKeep = null;
 
 function Today() {
-  const kept = todayKeep && todayKeep.deadline > Date.now() ? todayKeep : null;
+  // Kept for the same day, and while the timer (when there is one) hasn't run out.
+  const kept = todayKeep && todayKeep.day === new Date().toDateString() && (todayKeep.deadline == null || todayKeep.deadline > Date.now()) ? todayKeep : null;
   const [st, setSt] = useState(kept?.st ?? null);
   const [deadline, setDeadline] = useState(kept?.deadline ?? null);
   const [stories, setStories] = useState(kept?.stories ?? null);
-  const [tab, setTab] = useState(kept?.tab ?? "feed");
   const [posts, setPosts] = useState(kept?.posts ?? null); // Instagram's feed, a page at a time
   const [next, setNext] = useState(kept?.next ?? null);
   const [loading, setLoading] = useState(false);
   const [nearEnd, setNearEnd] = useState(false);
-  const [following, setFollowing] = useState(kept?.following ?? null); // people you follow, newest first
-  const [gathered, setGathered] = useState(kept?.gathered ?? false);
   const [spent, setSpent] = useState(kept?.spent ?? false);
   const [viewer, setViewer] = useState(null);
   const [error, setError] = useState(null);
@@ -1278,13 +1276,12 @@ function Today() {
 
   const apply = (x) => {
     setSt(x);
-    setDeadline(x.status === "open" ? Date.now() + x.remaining * 1000 : null);
+    setDeadline(x.status === "open" && x.remaining != null ? Date.now() + x.remaining * 1000 : null);
   };
   const end = useCallback(() => {
     todayKeep = null;
     setViewer(null);
     setPosts(null);
-    setFollowing(null);
     setStories(null);
     setDeadline(null);
     setSt((x) => ({ ...x, status: "done" }));
@@ -1297,8 +1294,8 @@ function Today() {
   }, []);
 
   useEffect(() => {
-    if (st?.status === "open") todayKeep = { st, deadline, stories, tab, posts, next, following, gathered, spent, shown: [...shown.current] };
-  }, [st, deadline, stories, tab, posts, next, following, gathered, spent]);
+    if (st?.status === "open") todayKeep = { day: new Date().toDateString(), st, deadline, stories, posts, next, spent, shown: [...shown.current] };
+  }, [st, deadline, stories, posts, next, spent]);
 
   const load = (cursor) => {
     setLoading(true);
@@ -1326,16 +1323,6 @@ function Today() {
     if (st?.status === "open" && stories === null) api("/api/daily/stories").then((x) => mounted.current && setStories(x)).catch(() => mounted.current && setStories([]));
   }, [st?.status]);
 
-  // Following: what's stored shows at once; new posts are gathered once a day.
-  useEffect(() => {
-    if (st?.status !== "open" || tab !== "following") return;
-    if (following === null) api("/api/daily/following").then((r) => (setFollowing(r.items), setGathered(r.gathered))).catch(fail);
-    if (!gathered)
-      api("/api/daily/following?gather=1")
-        .then((r) => (setFollowing(r.items), setGathered(true)))
-        .catch(fail);
-  }, [st?.status, tab]);
-
   // Load the next page a little before you reach the bottom, at most every 2.5s.
   useEffect(() => {
     const el = sentinel.current;
@@ -1343,22 +1330,18 @@ function Today() {
     const io = new IntersectionObserver(([e]) => setNearEnd(e.isIntersecting), { rootMargin: "1200px 0px" });
     io.observe(el);
     return () => io.disconnect();
-  }, [posts !== null, tab]);
+  }, [posts !== null]);
   useEffect(() => {
-    if (tab !== "feed" || !nearEnd || !next || loading) return;
+    if (!nearEnd || !next || loading) return;
     const wait = 2500 - (Date.now() - lastLoad.current);
     const t = setTimeout(() => load(next), Math.max(0, wait));
     return () => clearTimeout(t);
-  }, [tab, nearEnd, next, loading]);
+  }, [nearEnd, next, loading]);
 
   const ptr = usePullToRefresh(
     useCallback(async () => {
       api("/api/daily/stories?fresh=1").then(setStories).catch(() => {});
       try {
-        if (tab === "following") {
-          setFollowing((await api("/api/daily/following")).items);
-          return;
-        }
         const r = await api("/api/daily/feed?fresh=1");
         if (r.spent) {
           setSpent(true);
@@ -1372,20 +1355,11 @@ function Today() {
       } catch (e) {
         fail(e);
       }
-    }, [tab])
+    }, [])
   );
 
   const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
-  const update = useCallback((nm) => {
-    const swap = (p) => p && p.map((x) => (x.id === nm.id ? nm : x));
-    setPosts(swap);
-    setFollowing(swap);
-  }, []);
-  const switchTab = (t) => {
-    if (t === tab) return;
-    setTab(t);
-    window.scrollTo(0, 0);
-  };
+  const update = useCallback((nm) => setPosts((p) => p && p.map((x) => (x.id === nm.id ? nm : x))), []);
   const minutes = st?.minutes || 8;
 
   if (error) return html`<${TopBar} left=${html`<span></span>`} title="Today" /><${ErrorView} error=${error} />`;
@@ -1426,26 +1400,15 @@ function Today() {
         </button>`
       )}
     </div>`}
-    <div class="grid-tabs today-tabs">
-      <button class=${tab === "feed" ? "on" : ""} onClick=${() => switchTab("feed")}>For you</button>
-      <button class=${tab === "following" ? "on" : ""} onClick=${() => switchTab("following")}>Following</button>
-    </div>
-    ${tab === "following"
-      ? following === null
-        ? html`<div class="gathering"><${Spinner} /><small class="muted">Gathering posts from people you follow…</small></div>`
-        : html`${!gathered && html`<div class="gathering"><${Spinner} /><small class="muted">Looking for new posts…</small></div>`}
-          ${!following.length
-            ? gathered && html`<${Empty}><p class="muted">Nothing from people you follow this week.</p><//>`
-            : html`${following.map(card)}<p class="caught-up muted">${I.check} That's the last 7 days</p>`}`
-      : html`${posts === null
-          ? html`<${Spinner} />`
-          : !posts.length && !next && !loading
-          ? html`<${Empty}><p class="muted">${spent ? "That's enough feed for today." : "Nothing in your feed right now."}</p><//>`
-          : posts.map(card)}
-        <div ref=${sentinel} class="sentinel"></div>
-        ${posts !== null && (next || loading)
-          ? html`<${Spinner} />`
-          : posts?.length > 0 && html`<p class="caught-up muted">${I.check} ${spent ? "That's enough feed for today" : "That's everything for now. Pull down for new posts."}</p>`}`}
+    ${posts === null
+      ? html`<${Spinner} />`
+      : !posts.length && !next && !loading
+      ? html`<${Empty}><p class="muted">${spent ? "That's enough feed for today." : "Nothing in your feed right now."}</p><//>`
+      : posts.map(card)}
+    <div ref=${sentinel} class="sentinel"></div>
+    ${posts !== null && (next || loading)
+      ? html`<${Spinner} />`
+      : posts?.length > 0 && html`<p class="caught-up muted">${I.check} ${spent ? "That's enough feed for today" : "That's everything for now. Pull down for new posts."}</p>`}
     ${viewer &&
     html`<${Stories}
       key=${viewer.id}

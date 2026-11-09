@@ -659,8 +659,6 @@ def follow_request(cl, user_id: str, follow: bool) -> dict:
 def follow(user_id: str, body: Follow):
     fs = ig.run(follow_request, user_id, body.follow, kind="follow")
     ig.forget("user:")
-    if not body.follow:
-        pool_forget_user(user_id)
     return {"following": bool(fs.get("following")), "followed_by": bool(fs.get("followed_by")), "requested": bool(fs.get("outgoing_request"))}
 
 
@@ -684,6 +682,7 @@ def image(u: str):
 # -- today: posts and stories from people you follow, 5 minutes once a day -----
 
 DAILY_MINUTES = 8
+DAILY_TIMER = False  # off for now while Today is being tuned; True brings back the once-a-day minutes
 DAILY_MAX_AGE = dt.timedelta(days=7)  # older posts are skipped
 
 
@@ -699,6 +698,8 @@ def daily_status() -> dict:
     now = local_now()
     tomorrow = (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     base = {"minutes": DAILY_MINUTES, "resets_in": int((tomorrow - now).total_seconds())}
+    if not DAILY_TIMER:
+        return {**base, "status": "open", "remaining": None}
     d = ig.state().get("daily") or {}
     if d.get("date") != now.date().isoformat():
         return {**base, "status": "ready"}
@@ -768,68 +769,23 @@ def feed_verdict(media: dict) -> str:
     return "keep" if fs.get("following") else "not_following"
 
 
-def timeline_page(cl, max_id, source):
-    """One feed/timeline request.
-
-    instagrapi always paginates with pagination_source=feed_recs, which is the
-    "Suggested posts" list; "Older posts" (what you've already seen) needs its own
-    source. It also reports every post it has fetched as fully viewed, which takes
-    them out of your feed in the official app too, so send no views.
-    """
-    if source and source != "feed_recs":
-        send = cl.private_request
-
-        def private_request(endpoint, data=None, *args, **kwargs):
-            if endpoint == "feed/timeline/":
-                data = json.dumps({**json.loads(data), "pagination_source": source})
-            return send(endpoint, data, *args, **kwargs)
-
-        cl.private_request = private_request
-    try:  # with a max_id, instagrapi switches the reason to "pagination"
-        return cl.get_timeline_feed("cold_start_fetch", max_id=max_id, seen_posts=[])
-    finally:
-        cl.__dict__.pop("private_request", None)
+def timeline_page(cl, max_id):
+    """One feed/timeline request. instagrapi would report every post it has
+    fetched as fully viewed, which takes them out of your feed in the official
+    app too, so send no views. With a max_id it switches the reason to "pagination"."""
+    return cl.get_timeline_feed("cold_start_fetch", max_id=max_id, seen_posts=[])
 
 
-DEMARCATOR_LOGGED = []
-
-
-def key_shape(x, depth=0):
-    """Field names and types of a response, no values: for reading Instagram's structure in the logs."""
-    if depth > 4:
-        return "…"
-    if isinstance(x, dict):
-        return {k: key_shape(v, depth + 1) for k, v in x.items()}
-    if isinstance(x, list):
-        return [key_shape(x[0], depth + 1)] if x else []
-    return type(x).__name__
-
-
-def page_medias(raw: dict, tally: Counter):
-    """A timeline page's posts, the "Older posts" tucked under "You're all caught up",
-    and the cursor to read more of those."""
-    medias, past, past_cursor = [], [], None
+def page_medias(raw: dict, tally: Counter) -> list:
+    """A timeline page's posts. Other modules (carousels of suggested accounts,
+    "You're all caught up") aren't shown."""
+    medias = []
     for it in raw.get("feed_items") or []:
         if it.get("media_or_ad"):
             medias.append(it["media_or_ad"])
-            continue
-        tally.update(f"module:{k}" for k in it)  # carousels of suggested accounts and such: not shown
-        if it.get("end_of_feed_demarcator") and not DEMARCATOR_LOGGED:
-            DEMARCATOR_LOGGED.append(True)
-            log.info("end_of_feed_demarcator shape: %s", key_shape(it["end_of_feed_demarcator"]))
-        groups = ((it.get("end_of_feed_demarcator") or {}).get("group_set") or {}).get("groups") or []
-        for g in groups:
-            tally[f"group:{g.get('id')}"] += 1
-            if g.get("id") != "past_posts":
-                continue
-            for x in g.get("feed_items") or []:
-                media = x.get("media_or_ad") or (x if x.get("media_type") else None)
-                if media:
-                    tally["past_posts"] += 1
-                    past.append(media)
-            if g.get("next_max_id"):
-                past_cursor = (g["next_max_id"], g.get("pagination_source") or "past_posts")
-    return medias, past, past_cursor
+        else:
+            tally.update(f"module:{k}" for k in it)
+    return medias
 
 
 def to_post(media: dict, tally: Counter):
@@ -841,25 +797,6 @@ def to_post(media: dict, tally: Counter):
     if not m["ratio"] and media.get("original_width") and media.get("original_height"):
         m["ratio"] = media["original_width"] / media["original_height"]
     return m
-
-
-POOL_FILE = DATA / "daily_pool.json"
-POOL_LOCK = threading.Lock()  # the feed and likes/saves both rewrite the pool
-
-
-def pool_add(posts: list, drop: set = frozenset()):
-    """Remember posts from people you follow for a week: the Following tab is built from these."""
-    now = dt.datetime.now(dt.timezone.utc)
-    cutoff = now - DAILY_MAX_AGE
-    with POOL_LOCK:
-        stored = read_json(POOL_FILE)
-        pool = {k: v for k, v in stored.items() if dt.datetime.fromisoformat(v["m"]["taken_at"]) >= cutoff and k not in drop}
-        for m in posts:
-            if dt.datetime.fromisoformat(m["taken_at"]) >= cutoff:
-                pool[m["id"]] = {"m": m, "first_seen": pool.get(m["id"], {}).get("first_seen", now.isoformat())}
-        if pool != stored:
-            write_private_json(POOL_FILE, pool)
-        return pool
 
 
 MARKS = {}  # media pk -> (when, {"liked"/"saved": ...}): what you changed, laid over cached feed pages
@@ -882,26 +819,12 @@ def mark_of(media_pk: str) -> dict:
     return {}
 
 
-def pool_update(media_pk: str, **fields):
-    """Keep likes/saves made from Today in the stored copy."""
+def remember_mark(media_pk: str, **fields):
+    """A like/save you just made, shown on feed pages cached from before it."""
     MARKS[media_pk] = (time.monotonic(), {**mark_of(media_pk), **fields})
-    with POOL_LOCK:
-        pool = read_json(POOL_FILE)
-        if media_pk in pool:
-            pool[media_pk]["m"] = with_mark(pool[media_pk]["m"], fields)
-            write_private_json(POOL_FILE, pool)
 
 
-def pool_forget_user(user_id: str):
-    """Muted or unfollowed: their posts leave the Following tab."""
-    with POOL_LOCK:
-        pool = read_json(POOL_FILE)
-        kept = {k: v for k, v in pool.items() if str(v["m"].get("user", {}).get("id")) != str(user_id)}
-        if kept != pool:
-            write_private_json(POOL_FILE, kept)
-
-
-# Every real feed/timeline request, both tabs together, is counted against one
+# Every real feed/timeline request is counted against one
 # daily budget (kept in state.json, so a restart doesn't reset it) and spaced out.
 TIMELINE_DAILY_MAX = 40
 TIMELINE_GAP = 3.0  # seconds between two real requests
@@ -918,8 +841,8 @@ def timeline_used(day: str) -> int:
     return t.get("n", 0) if t.get("day") == day else 0
 
 
-def fetch_page(day: str, max_id, source) -> dict:
-    key = f"daily:feed:{day}:{source}:{max_id}"
+def fetch_page(day: str, max_id) -> dict:
+    key = f"daily:feed:{day}:{max_id}"
     hit = ig.peek(key)
     if hit is not None:
         return hit
@@ -934,43 +857,32 @@ def fetch_page(day: str, max_id, source) -> dict:
             time.sleep(wait)
         try:
             # Later pages are extras: a refusal there shouldn't count as trouble.
-            return ig.cached(key, 900, timeline_page, max_id, source, soft=bool(max_id))
+            return ig.cached(key, 900, timeline_page, max_id, soft=bool(max_id))
         finally:
             TIMELINE_LAST[0] = time.monotonic()
             ig.update_state(timeline={"day": day, "n": timeline_used(day) + 1})
 
 
-def daily_page(day: str, cursor: tuple | None):
-    """One timeline page, shared by both tabs: each page is fetched from Instagram once
-    (it stays cached past the 8 minutes) and whatever's from people you follow goes in the pool.
+def daily_page(day: str, cursor: str | None):
+    """One timeline page, fetched from Instagram once (it stays cached 15 minutes).
 
-    Returns the page's posts as Instagram ordered them, the ids among them that are
-    ads, the posts from people you follow (older ones included), where the feed goes
-    next, and where its "Older posts" go next.
+    Returns the page's posts as Instagram ordered them, the ids among them that
+    are ads, and where the feed goes next.
     """
-    max_id, source = cursor or (None, None)
-    raw = fetch_page(day, max_id, source)
+    raw = fetch_page(day, cursor)
     tally = Counter()
-    medias, past, past_cursor = page_medias(raw, tally)
-    shown, ads, following, gone = [], set(), [], set()
-    for media, is_past in [(x, False) for x in medias] + [(x, True) for x in past]:
+    shown, ads = [], set()
+    for media in page_medias(raw, tally):
         verdict = feed_verdict(media)
         tally[verdict] += 1
         m = to_post(media, tally)
         if not m:
             continue
-        m = with_mark(m, mark_of(m["id"]))
-        if verdict in ("muted", "not_following"):
-            gone.add(m["id"])
-        if not is_past:
-            shown.append(m)
-            if verdict == "ad":
-                ads.add(m["id"])
-        if verdict.startswith("keep"):
-            following.append(m)
-    pool_add(following, drop=gone)
+        shown.append(with_mark(m, mark_of(m["id"])))
+        if verdict == "ad":
+            ads.add(m["id"])
     more = raw.get("more_available") and raw.get("next_max_id")
-    return shown, ads, following, (more, source or "feed_recs") if more else None, past_cursor, tally
+    return shown, ads, more or None, tally
 
 
 FEED_REFRESH_GAP = 30  # seconds between pull-to-refreshes that actually ask Instagram
@@ -992,12 +904,12 @@ def daily_feed(cursor: str = "", fresh: bool = False):
     if not cursor:  # a new pass through the feed
         if fresh and timeline_used(day) < TIMELINE_DAILY_MAX and time.monotonic() - FEED["refreshed"] > FEED_REFRESH_GAP:
             FEED["refreshed"] = time.monotonic()
-            ig.forget(f"daily:feed:{day}:None:None")
+            ig.forget(f"daily:feed:{day}:None")
         FEED.update(served=set(), dry=0)
     elif FEED["dry"] >= 2:
         return {"items": [], "next": None}
     try:
-        shown, ads, _, nxt, _, tally = daily_page(day, (cursor, "feed_recs") if cursor else None)
+        shown, ads, nxt, tally = daily_page(day, cursor or None)
     except FeedBudgetSpent:
         log.info("daily feed: today's %d pages are used", TIMELINE_DAILY_MAX)
         return {"items": [], "next": None, "spent": True}
@@ -1011,50 +923,7 @@ def daily_feed(cursor: str = "", fresh: bool = False):
     done = not nxt or FEED["dry"] >= 2
     # Counts only, no content: lets us tune this from the logs.
     log.info("daily feed page=%s shown=%d new=%d used=%d %s", "next" if cursor else "first", len(shown), len(new), timeline_used(day), dict(tally))
-    return {"items": shown, "next": None if done else nxt[0]}
-
-
-FOLLOWING_GATHER_PAGES = 5
-
-
-@app.get("/api/daily/following")
-def daily_following(gather: bool = False):
-    """Posts from people you follow, newest first, from the last week.
-
-    Without `gather`, just what's stored (no Instagram requests). With it, once a
-    day: Instagram's chronological "Following" feed isn't reachable here, so read
-    ahead a few pages of the same feed (the ones you've scrolled are already
-    cached), switching to "Older posts" once Instagram offers them, and stop as
-    soon as pages stop adding anything. Those pages count against the same budget.
-    """
-    require_daily_open()
-    day = local_now().date().isoformat()
-    tally, pages = Counter(), 0
-    if gather and ig.state().get("following_gathered") != day:
-        ig.update_state(following_gathered=day)  # once a day, even if it stops early
-        cursor, dry, seen = None, 0, set()
-        while pages < FOLLOWING_GATHER_PAGES:
-            try:
-                _, _, following, nxt, past, t = daily_page(day, cursor)
-            except (ClientError, FeedBudgetSpent) as e:
-                if not pages and isinstance(e, ClientError):
-                    raise
-                tally[f"stopped:{type(e).__name__}"] += 1
-                break
-            pages += 1
-            tally.update(t)
-            new = {m["id"] for m in following} - seen
-            seen |= new
-            dry = 0 if new else dry + 1
-            cursor = past or nxt
-            if not cursor or dry >= 2:
-                break
-    with POOL_LOCK:
-        pool = read_json(POOL_FILE)
-    items = sorted((v["m"] for v in pool.values()), key=lambda m: m["taken_at"], reverse=True)
-    if gather:
-        log.info("daily following pages=%d pool=%d used=%d %s", pages, len(items), timeline_used(day), dict(tally))
-    return {"items": items, "gathered": ig.state().get("following_gathered") == day}
+    return {"items": shown, "next": None if done else nxt}
 
 
 def reels_media(cl, user_ids):
@@ -1197,8 +1066,6 @@ def mute(user_id: str, body: Mute):
     if body.stories is not None:
         ig.run(lambda cl: cl.mute_stories_from_follow(user_id, revert=not body.stories), kind="other")
     ig.forget("user:", "daily:tray:", "daily:reels:")
-    if body.posts:
-        pool_forget_user(user_id)
     return {"ok": True}
 
 
@@ -1235,7 +1102,7 @@ class Save(BaseModel):
 def save(media_pk: str, body: Save):
     ig.run(lambda cl: cl.media_save(body.media_id, revert=not body.save), kind="like")
     ig.forget(f"media:{media_pk}", "mine:saved")
-    pool_update(media_pk, saved=body.save)
+    remember_mark(media_pk, saved=body.save)
     return {"saved": body.save}
 
 
@@ -1267,7 +1134,7 @@ def like(media_pk: str, body: Like):
     if not ig.run(lambda cl: cl.media_like(body.media_id, revert=not body.like), kind="like"):
         return err(502, "instagram", "Instagram didn't take the like. Try again.")
     ig.forget(f"media:{media_pk}", "mine:liked")
-    pool_update(media_pk, liked=body.like)
+    remember_mark(media_pk, liked=body.like)
     return {"liked": body.like}
 
 
