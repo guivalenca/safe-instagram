@@ -458,6 +458,7 @@ function UserRow({ u, onRemove }) {
       <span class="row-text">
         <${Name} u=${u} />
         <small class="muted">${u.name}${u.private && u.name ? " · " : ""}${u.private ? "Private" : ""}</small>
+        ${u.social && html`<small class="muted">${u.social}</small>`}
       </span>
     <//>
     ${onRemove && html`<button class="icon small muted" onClick=${onRemove}>${I.x}</button>`}
@@ -535,6 +536,8 @@ function Profile({ username }) {
   useEffect(() => {
     if (hasStories) new Image().src = stories[0].img; // so tapping the ring opens instantly
   }, [hasStories && stories[0].id]);
+  const requests = useQuery(p?.me ? "/api/requests" : null, 60000).data;
+  const newRequests = requests?.some((r) => !seenRequests().has(r.id));
   const [sheet, setSheet] = useState(false);
   const [myTab, setMyTab] = useState(profileTab.value);
   const ptr = usePullToRefresh(
@@ -556,7 +559,7 @@ function Profile({ username }) {
   return html`<div class="page">
     <${TopBar}
       title=${html`<${Name} u=${u} />`}
-      left=${p?.me ? html`<${Link} href="/requests" class="icon" aria-label="Follow requests">${I.requests}<//>` : undefined}
+      left=${p?.me ? html`<${Link} href="/requests" class="icon" aria-label="Follow requests">${I.requests}${newRequests && html`<i class="icon-dot"></i>`}<//>` : undefined}
       right=${p?.me && html`<${Link} href="/settings" class="icon">${I.gear}<//>`}
     />
     ${ptr}
@@ -572,6 +575,7 @@ function Profile({ username }) {
       ${u.name && html`<b>${u.name}</b>`}
       ${p?.bio && html`<p>${p.bio}</p>`}
       ${p?.url && html`<a href=${p.url} target="_blank" rel="noopener" class="url">${p.url.replace(/^https?:\/\/(www\.)?/, "")}</a>`}
+      ${p?.social && html`<small class="muted">${p.social}</small>`}
       ${p?.rel?.followed_by && html`<small class="muted">Follows you</small>`}
     </section>
     ${p && !p.me && html`<${ProfileActions} p=${p} k=${key} onUnfollow=${() => setSheet(true)} />`}
@@ -614,10 +618,24 @@ function Profile({ username }) {
   </div>`;
 }
 
+const SEEN_REQUESTS_KEY = "seen-requests";
+const seenRequests = () => new Set(JSON.parse(localStorage.getItem(SEEN_REQUESTS_KEY) || "[]"));
+
+// Who you both know. The requests list doesn't always say, so ask their profile
+// (the same call as opening it) for the first few.
+function RequestSocial({ u, look }) {
+  const p = useQuery(look && !u.social ? `/api/u/${encodeURIComponent(u.username)}` : null, 10 * 60000).data;
+  const text = u.social || p?.social;
+  return text ? html`<small class="muted">${text}</small>` : null;
+}
+
 function Requests() {
   const key = "/api/requests";
   const { data, error, refresh } = useQuery(key, 30000);
   const ptr = usePullToRefresh(refresh);
+  useEffect(() => {
+    if (data) localStorage.setItem(SEEN_REQUESTS_KEY, JSON.stringify(data.map((u) => u.id)));
+  }, [data]);
   const answer = async (u, approve) => {
     const before = store.get(key).data;
     setData(key, before.filter((x) => x.id !== u.id));
@@ -641,12 +659,13 @@ function Requests() {
       ? html`<${Empty}><p class="muted">No one's waiting.</p><//>`
       : html`<ul class="list">
           ${data.map(
-            (u) => html`<li class="row" key=${u.id}>
+            (u, i) => html`<li class="row" key=${u.id}>
               <${Link} href=${`/u/${encodeURIComponent(u.username)}`} warm=${() => warmUser(u)} class="row-main">
                 <${Avatar} src=${u.pic} />
                 <span class="row-text">
                   <${Name} u=${u} />
                   <small class="muted">${u.name}</small>
+                  <${RequestSocial} u=${u} look=${i < 10} />
                 </span>
               <//>
               <div class="row-actions">
@@ -1177,9 +1196,15 @@ function Today() {
   const [st, setSt] = useState(null);
   const [deadline, setDeadline] = useState(null);
   const [stories, setStories] = useState(null);
-  const [posts, setPosts] = useState(null);
+  const [tab, setTab] = useState("feed");
+  const [posts, setPosts] = useState(null); // Instagram's feed, a page at a time
+  const [next, setNext] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [nearEnd, setNearEnd] = useState(false);
+  const [following, setFollowing] = useState(null); // people you follow, newest first
   const [viewer, setViewer] = useState(null);
   const [error, setError] = useState(null);
+  const sentinel = useRef();
 
   const apply = (x) => {
     setSt(x);
@@ -1188,6 +1213,7 @@ function Today() {
   const end = useCallback(() => {
     setViewer(null);
     setPosts(null);
+    setFollowing(null);
     setStories(null);
     setDeadline(null);
     setSt((x) => ({ ...x, status: "done" }));
@@ -1199,17 +1225,57 @@ function Today() {
     api("/api/daily").then(apply).catch(setError);
   }, []);
 
-  // One list, newest first, that ends: the server gathers it all up front.
+  const load = (cursor) => {
+    setLoading(true);
+    return api(`/api/daily/feed${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`)
+      .then((r) => {
+        setPosts((p) => {
+          const have = new Set((p || []).map((x) => x.id));
+          return [...(p || []), ...r.items.filter((m) => !have.has(m.id))];
+        });
+        setNext(r.next);
+      })
+      .catch(fail)
+      .finally(() => setLoading(false));
+  };
+
   useEffect(() => {
     if (st?.status !== "open") return;
     api("/api/daily/stories").then(setStories).catch(() => setStories([]));
-    api("/api/daily/feed")
-      .then((r) => setPosts(r.items))
-      .catch(fail);
+    load(null);
   }, [st?.status]);
 
+  // Following is only gathered if you open it.
+  useEffect(() => {
+    if (st?.status !== "open" || tab !== "following" || following) return;
+    api("/api/daily/following")
+      .then((r) => setFollowing(r.items))
+      .catch(fail);
+  }, [st?.status, tab]);
+
+  // Keep a page ahead: start loading well before you reach the bottom.
+  useEffect(() => {
+    const el = sentinel.current;
+    if (!el) return;
+    const io = new IntersectionObserver(([e]) => setNearEnd(e.isIntersecting), { rootMargin: "2500px 0px" });
+    io.observe(el);
+    return () => io.disconnect();
+  }, [posts !== null, tab]);
+  useEffect(() => {
+    if (tab === "feed" && nearEnd && next && !loading) load(next);
+  }, [tab, nearEnd, next, loading]);
+
   const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
-  const update = useCallback((nm) => setPosts((p) => p.map((x) => (x.id === nm.id ? nm : x))), []);
+  const update = useCallback((nm) => {
+    const swap = (p) => p && p.map((x) => (x.id === nm.id ? nm : x));
+    setPosts(swap);
+    setFollowing(swap);
+  }, []);
+  const switchTab = (t) => {
+    if (t === tab) return;
+    setTab(t);
+    window.scrollTo(0, 0);
+  };
   const minutes = st?.minutes || 8;
 
   if (error) return html`<${TopBar} left=${html`<span></span>`} title="Today" /><${ErrorView} error=${error} />`;
@@ -1221,7 +1287,7 @@ function Today() {
       <div class="today-gate">
         <div class="today-icon">${I.sun}</div>
         <h2>Your ${minutes} minutes</h2>
-        <p class="muted">Posts and stories from people you follow. Once a day, then it closes until tomorrow.</p>
+        <p class="muted">Your feed and stories. Once a day, then it closes until tomorrow.</p>
         <button class="btn" onClick=${start}>Start</button>
         <small class="muted">The timer keeps running if you leave.</small>
       </div>
@@ -1237,6 +1303,7 @@ function Today() {
       </div>
     </div>`;
 
+  const card = (m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`;
   return html`<div class="page">
     <${TopBar} left=${html`<span></span>`} title="Today" right=${deadline && html`<${Countdown} deadline=${deadline} onEnd=${end} />`} />
     ${stories?.length > 0 &&
@@ -1248,12 +1315,23 @@ function Today() {
         </button>`
       )}
     </div>`}
-    ${posts === null
-      ? html`<div class="gathering"><${Spinner} /><small class="muted">Gathering posts from people you follow…</small></div>`
-      : !posts.length
-      ? html`<${Empty}><p class="muted">Nothing new from people you follow.</p><//>`
-      : html`${posts.map((m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`)}
-          <p class="caught-up muted">${I.check} You're all caught up</p>`}
+    <div class="grid-tabs today-tabs">
+      <button class=${tab === "feed" ? "on" : ""} onClick=${() => switchTab("feed")}>For you</button>
+      <button class=${tab === "following" ? "on" : ""} onClick=${() => switchTab("following")}>Following</button>
+    </div>
+    ${tab === "following"
+      ? following === null
+        ? html`<div class="gathering"><${Spinner} /><small class="muted">Gathering posts from people you follow…</small></div>`
+        : !following.length
+        ? html`<${Empty}><p class="muted">Nothing from people you follow this week.</p><//>`
+        : html`${following.map(card)}<p class="caught-up muted">${I.check} That's the last 7 days</p>`
+      : html`${posts === null
+          ? html`<${Spinner} />`
+          : !posts.length && !next && !loading
+          ? html`<${Empty}><p class="muted">Nothing in your feed right now.</p><//>`
+          : posts.map(card)}
+        <div ref=${sentinel} class="sentinel"></div>
+        ${posts !== null && (next || loading) ? html`<${Spinner} />` : posts?.length > 0 && html`<p class="caught-up muted">${I.check} That's everything for now</p>`}`}
     ${viewer &&
     html`<${Stories}
       key=${viewer.id}
@@ -1460,6 +1538,10 @@ function Thread({ id }) {
   }, [refresh]);
 
   const msgs = data ? [...data.messages, ...outbox.filter((o) => !data.messages.some((m) => m.id === o.serverId))] : outbox;
+  useEffect(() => {
+    const inbox = store.get("/api/dm")?.data;
+    if (data && inbox?.some((t) => t.id === id && t.unread)) setData("/api/dm", inbox.map((t) => (t.id === id ? { ...t, unread: false } : t)));
+  }, [!!data, id]);
   useLayoutEffect(() => {
     if (stick.current) window.scrollTo(0, document.body.scrollHeight);
   }, [msgs.length, data?.n]);

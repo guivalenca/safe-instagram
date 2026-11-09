@@ -212,6 +212,19 @@ svg.fill {
 .icon:active {
   opacity: 0.5;
 }
+.icon {
+  position: relative;
+}
+.icon-dot {
+  position: absolute;
+  top: 9px;
+  right: 7px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px var(--bg);
+}
 .icon.small {
   width: 32px;
   height: 32px;
@@ -1606,6 +1619,14 @@ img.loaded,
 .grid-tabs .on {
   color: var(--fg);
   box-shadow: inset 0 -1px 0 var(--fg);
+}
+.today-tabs {
+  border-top: none;
+  border-bottom: 0.5px solid var(--line);
+}
+.today-tabs button {
+  font-size: 15px;
+  font-weight: 600;
 }
 .grid-tabs svg {
   width: 22px;
