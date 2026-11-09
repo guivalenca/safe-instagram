@@ -28,8 +28,10 @@ from fastapi.staticfiles import StaticFiles
 from instagrapi.exceptions import (
     BadPassword,
     ClientError,
+    ClientNotFoundError,
     ClientThrottledError,
     FeedbackRequired,
+    MediaNotFound,
     NotFoundError,
     PleaseWaitFewMinutes,
     PrivateAccount,
@@ -37,7 +39,7 @@ from instagrapi.exceptions import (
 )
 import requests
 from instagrapi import config as ig_config
-from instagrapi.extractors import extract_media_v1, extract_user_short, extract_user_v1
+from instagrapi.extractors import extract_media_v1, extract_story_v1, extract_user_short, extract_user_v1
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from pydantic import BaseModel
@@ -212,7 +214,7 @@ def daily_limit(request, exc: DailyLimit):
 
 @app.exception_handler(ClientError)
 def instagram_error(request, exc: ClientError):
-    if isinstance(exc, NotFoundError):
+    if isinstance(exc, (NotFoundError, ClientNotFoundError)):
         return err(404, "not_found", "That doesn't exist anymore.")
     if isinstance(exc, PrivateAccount):
         return err(403, "private", "This account is private.")
@@ -276,6 +278,26 @@ def small_image(m):
 
 def media_tile(m):
     return {"id": str(m.pk), "thumb": small_image(m), "type": m.media_type}
+
+
+def media_from_raw(raw: dict):
+    """extract_media_v1, keeping whether you saved it: the private API calls that
+    `has_viewer_saved`, which instagrapi doesn't read."""
+    raw = dict(raw)
+    raw.setdefault("viewer_has_saved", bool(raw.get("has_viewer_saved")))
+    return extract_media_v1(raw)
+
+
+def media_info(cl, media_pk):
+    try:
+        items = cl.private_request(f"media/{media_pk}/info/").get("items") or []
+    except ClientError as e:  # a deleted post: "Media not found or unavailable" (not trouble, as in media_info_v1)
+        if "not found" in str(e).lower() or "unavailable" in str(e).lower():
+            raise MediaNotFound(media_pk=media_pk) from e
+        raise
+    if not items:
+        raise MediaNotFound(media_pk=media_pk)
+    return media_from_raw(items[0])
 
 
 def media_full(m):
@@ -424,16 +446,12 @@ def user_and_friendship(cl, username):
     fs = raw.get("friendship_status") or {}
     context = social(raw, "profile")
     user = extract_user_v1(dict(raw))
-    if "following" not in fs:  # not included this time: ask separately
-        r = cl.user_friendship_v1(user.pk)
-        fs = {
-            "following": r.following,
-            "followed_by": r.followed_by,
-            "outgoing_request": r.outgoing_request,
-            "incoming_request": r.incoming_request,
-            "muting": r.muting,
-            "is_muting_reel": r.is_muting_reel,
-        }
+    if "friendship" not in SOCIAL_KEYS_LOGGED:
+        SOCIAL_KEYS_LOGGED.add("friendship")
+        log.info("profile friendship_status fields: %s", sorted(fs))
+    if "following" not in fs and str(user.pk) != str(cl.user_id):  # not included this time: ask separately
+        # (not user_friendship_v1: it turns throttling and errors into None)
+        fs = cl.private_request(f"friendships/show/{user.pk}/")
     return user, fs, context
 
 
@@ -480,10 +498,21 @@ def posts(user_id: str, cursor: str = ""):
     return {"items": [media_tile(m) for m in medias], "next": next_cursor or None}
 
 
+def stories_from_items(items: list) -> list:
+    """Story JSON from raw reel items, with whether you liked each (instagrapi's Story drops it)."""
+    out = [{**story_json(extract_story_v1(it)), "liked": bool(it.get("has_liked"))} for it in items]
+    return sorted(out, key=lambda x: x["taken_at"])
+
+
+def user_stories(cl, user_id):
+    params = {"supported_capabilities_new": json.dumps(ig_config.SUPPORTED_CAPABILITIES)}
+    reel = cl.private_request(f"feed/user/{int(user_id)}/story/", params=params).get("reel") or {}
+    return stories_from_items(reel.get("items") or [])
+
+
 @app.get("/api/u/{user_id}/stories")
 def stories(user_id: str):
-    items = ig.cached(f"stories:{user_id}", 120, lambda cl: cl.user_stories_v1(user_id), soft=True)
-    return [story_json(st) for st in sorted(items, key=lambda st: st.taken_at)]
+    return ig.cached(f"stories:{user_id}", 120, user_stories, user_id, soft=True)
 
 
 def highlight_cover(h):
@@ -512,6 +541,10 @@ class StoryLike(BaseModel):
 @app.post("/api/stories/like")
 def story_like(body: StoryLike):
     ig.run(lambda cl: cl.story_like(body.media_id, revert=not body.like, mark_seen=False), kind="like")
+    owner = body.media_id.split("_")[-1]
+    cached = ig.peek(f"stories:{owner}")
+    if cached:  # keep the cached copy in step instead of fetching it again
+        ig.put(f"stories:{owner}", 120, [{**x, "liked": body.like} if x["media_id"] == body.media_id else x for x in cached])
     return {"liked": body.like}
 
 
@@ -559,14 +592,52 @@ def story_reply(body: StoryReply):
     return {"ok": True, "linked": linked}
 
 
-class Ids(BaseModel):
-    ids: list[str]
+class SeenStory(BaseModel):
+    media_id: str  # "<story pk>_<owner pk>"
+    taken_at: str
+
+
+class SeenStories(BaseModel):
+    items: list[SeenStory] = []
+    ids: list[str] = []  # older app versions; nothing to send without the owner
+    done: bool = False  # watched to their last story
+
+
+def mark_stories_seen(cl, items):
+    """Tell Instagram these stories were watched, the way the app does.
+
+    (instagrapi's story_seen looks up each story's owner with an extra request
+    and reports a made-up posting time, which Instagram ignores.)
+    """
+    now = int(time.time())
+    reels = {}
+    for it in items:
+        taken = int(dt.datetime.fromisoformat(it.taken_at).timestamp())
+        owner = it.media_id.split("_")[-1]
+        reels[f"{it.media_id}_{owner}"] = [f"{taken}_{max(now, taken)}"]
+    data = {
+        "container_module": "feed_timeline",
+        "live_vods_skipped": {},
+        "nuxes_skipped": {},
+        "nuxes": {},
+        "reels": reels,
+        "live_vods": {},
+        "reel_media_skipped": {},
+    }
+    result = cl.private_request("/v2/media/seen/?reel=1&live_vod=0", cl.with_default_data(data))
+    if result.get("status") != "ok":
+        raise ClientError(f"seen: {result.get('status')}")
+    return True
 
 
 @app.post("/api/stories/seen")
-def stories_seen(body: Ids):
-    if body.ids:
-        ig.run(lambda cl: cl.story_seen([int(i) for i in body.ids]), kind="seen")
+def stories_seen(body: SeenStories):
+    items = [it for it in body.items if "_" in it.media_id]
+    if items:
+        ok = ig.run(mark_stories_seen, items, kind="seen")
+        log.info("stories seen sent=%d ok=%s", len(items), bool(ok))
+        if body.done:  # stopping partway leaves them unwatched in the tray, as Instagram does
+            watched(local_now().date().isoformat()).update(it.media_id.split("_")[-1] for it in items)
     return {"ok": True}
 
 
@@ -574,15 +645,26 @@ class Follow(BaseModel):
     follow: bool
 
 
+def follow_request(cl, user_id: str, follow: bool) -> dict:
+    """friendships/create or destroy, without instagrapi's extra pre-check; the
+    answer already carries the new relationship."""
+    data = cl.with_action_data({"user_id": user_id, "_uid": str(cl.user_id), "container_module": "profile"})
+    if follow:
+        data["include_follow_friction_check"] = "1"
+    result = cl.private_request(f"friendships/{'create' if follow else 'destroy'}/{user_id}/", data)
+    return result.get("friendship_status") or {}
+
+
 @app.post("/api/u/{user_id}/follow")
 def follow(user_id: str, body: Follow):
-    if body.follow:
-        ig.run(lambda cl: cl.user_follow(user_id), kind="follow")
-    else:
-        ig.run(lambda cl: cl.user_unfollow(user_id), kind="follow")
+    fs = ig.run(follow_request, user_id, body.follow, kind="follow")
     ig.forget("user:")
-    rel = ig.run(lambda cl: cl.user_friendship_v1(user_id))
-    return {"following": rel.following, "followed_by": rel.followed_by, "requested": rel.outgoing_request}
+    if not body.follow:
+        pool_forget_user(user_id)
+    return {"following": bool(fs.get("following")), "followed_by": bool(fs.get("followed_by")), "requested": bool(fs.get("outgoing_request"))}
+
+
+CDN = requests.Session()  # keeps connections to the image servers open
 
 
 @app.get("/api/img")
@@ -590,7 +672,7 @@ def image(u: str):
     host = urlparse(u).hostname or ""
     if not u.startswith("https://") or not (host.endswith(".cdninstagram.com") or host.endswith(".fbcdn.net")):
         return err(400, "bad_url", "Not an Instagram image.")
-    r = requests.get(u, timeout=10)  # Instagram's public CDN; no account involved
+    r = CDN.get(u, timeout=10)  # Instagram's public CDN; no account involved
     return Response(
         r.content,
         status_code=r.status_code,
@@ -709,6 +791,20 @@ def timeline_page(cl, max_id, source):
         cl.__dict__.pop("private_request", None)
 
 
+DEMARCATOR_LOGGED = []
+
+
+def key_shape(x, depth=0):
+    """Field names and types of a response, no values: for reading Instagram's structure in the logs."""
+    if depth > 4:
+        return "…"
+    if isinstance(x, dict):
+        return {k: key_shape(v, depth + 1) for k, v in x.items()}
+    if isinstance(x, list):
+        return [key_shape(x[0], depth + 1)] if x else []
+    return type(x).__name__
+
+
 def page_medias(raw: dict, tally: Counter):
     """A timeline page's posts, the "Older posts" tucked under "You're all caught up",
     and the cursor to read more of those."""
@@ -718,6 +814,9 @@ def page_medias(raw: dict, tally: Counter):
             medias.append(it["media_or_ad"])
             continue
         tally.update(f"module:{k}" for k in it)  # carousels of suggested accounts and such: not shown
+        if it.get("end_of_feed_demarcator") and not DEMARCATOR_LOGGED:
+            DEMARCATOR_LOGGED.append(True)
+            log.info("end_of_feed_demarcator shape: %s", key_shape(it["end_of_feed_demarcator"]))
         groups = ((it.get("end_of_feed_demarcator") or {}).get("group_set") or {}).get("groups") or []
         for g in groups:
             tally[f"group:{g.get('id')}"] += 1
@@ -735,7 +834,7 @@ def page_medias(raw: dict, tally: Counter):
 
 def to_post(media: dict, tally: Counter):
     try:
-        m = media_full(extract_media_v1(dict(media)))
+        m = media_full(media_from_raw(media))
     except Exception:
         tally["unparsed"] += 1
         return None
@@ -748,103 +847,214 @@ POOL_FILE = DATA / "daily_pool.json"
 POOL_LOCK = threading.Lock()  # the feed and likes/saves both rewrite the pool
 
 
-def pool_add(posts: list):
+def pool_add(posts: list, drop: set = frozenset()):
     """Remember posts from people you follow for a week: the Following tab is built from these."""
     now = dt.datetime.now(dt.timezone.utc)
     cutoff = now - DAILY_MAX_AGE
     with POOL_LOCK:
-        pool = {k: v for k, v in read_json(POOL_FILE).items() if dt.datetime.fromisoformat(v["m"]["taken_at"]) >= cutoff}
+        stored = read_json(POOL_FILE)
+        pool = {k: v for k, v in stored.items() if dt.datetime.fromisoformat(v["m"]["taken_at"]) >= cutoff and k not in drop}
         for m in posts:
             if dt.datetime.fromisoformat(m["taken_at"]) >= cutoff:
                 pool[m["id"]] = {"m": m, "first_seen": pool.get(m["id"], {}).get("first_seen", now.isoformat())}
-        write_private_json(POOL_FILE, pool)
+        if pool != stored:
+            write_private_json(POOL_FILE, pool)
         return pool
+
+
+MARKS = {}  # media pk -> (when, {"liked"/"saved": ...}): what you changed, laid over cached feed pages
+MARK_TTL = 900  # as long as a feed page stays cached; after that Instagram's own answer is fresh
+
+
+def with_mark(m: dict, mark: dict) -> dict:
+    """A post with your like/save applied, keeping the like count in step with the heart."""
+    out = {**m, **mark}
+    if "liked" in mark and bool(m.get("liked")) != mark["liked"] and m.get("likes") is not None:
+        out["likes"] = max(0, m["likes"] + (1 if mark["liked"] else -1))
+    return out
+
+
+def mark_of(media_pk: str) -> dict:
+    hit = MARKS.get(media_pk)
+    if hit and time.monotonic() - hit[0] < MARK_TTL:
+        return hit[1]
+    MARKS.pop(media_pk, None)
+    return {}
 
 
 def pool_update(media_pk: str, **fields):
     """Keep likes/saves made from Today in the stored copy."""
+    MARKS[media_pk] = (time.monotonic(), {**mark_of(media_pk), **fields})
     with POOL_LOCK:
         pool = read_json(POOL_FILE)
         if media_pk in pool:
-            pool[media_pk]["m"].update(fields)
+            pool[media_pk]["m"] = with_mark(pool[media_pk]["m"], fields)
             write_private_json(POOL_FILE, pool)
+
+
+def pool_forget_user(user_id: str):
+    """Muted or unfollowed: their posts leave the Following tab."""
+    with POOL_LOCK:
+        pool = read_json(POOL_FILE)
+        kept = {k: v for k, v in pool.items() if str(v["m"].get("user", {}).get("id")) != str(user_id)}
+        if kept != pool:
+            write_private_json(POOL_FILE, kept)
+
+
+# Every real feed/timeline request, both tabs together, is counted against one
+# daily budget (kept in state.json, so a restart doesn't reset it) and spaced out.
+TIMELINE_DAILY_MAX = 40
+TIMELINE_GAP = 3.0  # seconds between two real requests
+TIMELINE_LOCK = threading.Lock()  # one real fetch at a time; waiting here doesn't hold ig.lock
+TIMELINE_LAST = [0.0]
+
+
+class FeedBudgetSpent(Exception):
+    pass
+
+
+def timeline_used(day: str) -> int:
+    t = ig.state().get("timeline") or {}
+    return t.get("n", 0) if t.get("day") == day else 0
+
+
+def fetch_page(day: str, max_id, source) -> dict:
+    key = f"daily:feed:{day}:{source}:{max_id}"
+    hit = ig.peek(key)
+    if hit is not None:
+        return hit
+    with TIMELINE_LOCK:
+        hit = ig.peek(key)
+        if hit is not None:
+            return hit
+        if timeline_used(day) >= TIMELINE_DAILY_MAX:
+            raise FeedBudgetSpent()
+        wait = TIMELINE_GAP - (time.monotonic() - TIMELINE_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            # Later pages are extras: a refusal there shouldn't count as trouble.
+            return ig.cached(key, 900, timeline_page, max_id, source, soft=bool(max_id))
+        finally:
+            TIMELINE_LAST[0] = time.monotonic()
+            ig.update_state(timeline={"day": day, "n": timeline_used(day) + 1})
 
 
 def daily_page(day: str, cursor: tuple | None):
     """One timeline page, shared by both tabs: each page is fetched from Instagram once
     (it stays cached past the 8 minutes) and whatever's from people you follow goes in the pool.
 
-    Returns the page's posts as Instagram ordered them, the ones from people you
-    follow (older ones included), where the feed goes next, and where its "Older posts" go next.
+    Returns the page's posts as Instagram ordered them, the ids among them that are
+    ads, the posts from people you follow (older ones included), where the feed goes
+    next, and where its "Older posts" go next.
     """
     max_id, source = cursor or (None, None)
-    # Later pages are extras: a refusal there shouldn't count as trouble.
-    raw = ig.cached(f"daily:feed:{day}:{source}:{max_id}", 900, timeline_page, max_id, source, soft=bool(cursor))
+    raw = fetch_page(day, max_id, source)
     tally = Counter()
     medias, past, past_cursor = page_medias(raw, tally)
-    shown, following = [], []
+    shown, ads, following, gone = [], set(), [], set()
     for media, is_past in [(x, False) for x in medias] + [(x, True) for x in past]:
         verdict = feed_verdict(media)
         tally[verdict] += 1
         m = to_post(media, tally)
         if not m:
             continue
+        m = with_mark(m, mark_of(m["id"]))
+        if verdict in ("muted", "not_following"):
+            gone.add(m["id"])
         if not is_past:
             shown.append(m)
+            if verdict == "ad":
+                ads.add(m["id"])
         if verdict.startswith("keep"):
             following.append(m)
-    pool_add(following)
+    pool_add(following, drop=gone)
     more = raw.get("more_available") and raw.get("next_max_id")
-    return shown, following, (more, source or "feed_recs") if more else None, past_cursor, tally
+    return shown, ads, following, (more, source or "feed_recs") if more else None, past_cursor, tally
+
+
+FEED_REFRESH_GAP = 30  # seconds between pull-to-refreshes that actually ask Instagram
+FEED = {"day": None, "served": set(), "dry": 0, "refreshed": 0.0}
 
 
 @app.get("/api/daily/feed")
-def daily_feed(cursor: str = ""):
-    """Instagram's own feed, a page at a time, as it sends it: ads and suggestions included."""
-    require_daily_open()
-    day = local_now().date().isoformat()
-    shown, _, nxt, _, tally = daily_page(day, (cursor, "feed_recs") if cursor else None)
-    # Counts only, no content: lets us tune this from the logs.
-    log.info("daily feed page=%s shown=%d %s", "next" if cursor else "first", len(shown), dict(tally))
-    return {"items": shown, "next": nxt[0] if nxt else None}
+def daily_feed(cursor: str = "", fresh: bool = False):
+    """Instagram's own feed, a page at a time, as it sends it: ads and suggestions included.
 
-
-FOLLOWING_MAX_PAGES = 6  # per day, most of them shared with the feed tab
-
-
-@app.get("/api/daily/following")
-def daily_following():
-    """Posts from people you follow, newest first, from the last week.
-
-    Instagram's chronological "Following" feed isn't reachable here, so read
-    ahead a few pages of the same feed (the ones you've scrolled are already
-    cached), switching to "Older posts" once Instagram offers them, and stop
-    as soon as pages stop adding anything.
+    Past "You're all caught up" Instagram can keep answering with the same few
+    posts (plus a new ad) under a new cursor; two pages in a row with nothing new
+    but ads end the feed.
     """
     require_daily_open()
     day = local_now().date().isoformat()
-    tally, cursor, pages, dry, seen = Counter(), None, 0, 0, set()
-    while pages < FOLLOWING_MAX_PAGES:
-        try:
-            _, following, nxt, past, t = daily_page(day, cursor)
-        except ClientError as e:
-            if not pages:
-                raise
-            tally[f"failed:{type(e).__name__}"] += 1
-            break
-        pages += 1
-        tally.update(t)
-        new = {m["id"] for m in following} - seen
-        seen |= new
-        dry = 0 if new else dry + 1
-        cursor = past or nxt
-        if not cursor or dry >= 2:
-            break
+    if FEED["day"] != day:
+        FEED.update(day=day, served=set(), dry=0, refreshed=0.0)
+    if not cursor:  # a new pass through the feed
+        if fresh and timeline_used(day) < TIMELINE_DAILY_MAX and time.monotonic() - FEED["refreshed"] > FEED_REFRESH_GAP:
+            FEED["refreshed"] = time.monotonic()
+            ig.forget(f"daily:feed:{day}:None:None")
+        FEED.update(served=set(), dry=0)
+    elif FEED["dry"] >= 2:
+        return {"items": [], "next": None}
+    try:
+        shown, ads, _, nxt, _, tally = daily_page(day, (cursor, "feed_recs") if cursor else None)
+    except FeedBudgetSpent:
+        log.info("daily feed: today's %d pages are used", TIMELINE_DAILY_MAX)
+        return {"items": [], "next": None, "spent": True}
+    except ClientError:
+        if not cursor:
+            raise
+        return {"items": [], "next": None}  # a later page failing just ends the list
+    new = [m for m in shown if m["id"] not in FEED["served"] and m["id"] not in ads]
+    FEED["served"].update(m["id"] for m in shown)
+    FEED["dry"] = 0 if new or not cursor else FEED["dry"] + 1
+    done = not nxt or FEED["dry"] >= 2
+    # Counts only, no content: lets us tune this from the logs.
+    log.info("daily feed page=%s shown=%d new=%d used=%d %s", "next" if cursor else "first", len(shown), len(new), timeline_used(day), dict(tally))
+    return {"items": shown, "next": None if done else nxt[0]}
+
+
+FOLLOWING_GATHER_PAGES = 5
+
+
+@app.get("/api/daily/following")
+def daily_following(gather: bool = False):
+    """Posts from people you follow, newest first, from the last week.
+
+    Without `gather`, just what's stored (no Instagram requests). With it, once a
+    day: Instagram's chronological "Following" feed isn't reachable here, so read
+    ahead a few pages of the same feed (the ones you've scrolled are already
+    cached), switching to "Older posts" once Instagram offers them, and stop as
+    soon as pages stop adding anything. Those pages count against the same budget.
+    """
+    require_daily_open()
+    day = local_now().date().isoformat()
+    tally, pages = Counter(), 0
+    if gather and ig.state().get("following_gathered") != day:
+        ig.update_state(following_gathered=day)  # once a day, even if it stops early
+        cursor, dry, seen = None, 0, set()
+        while pages < FOLLOWING_GATHER_PAGES:
+            try:
+                _, _, following, nxt, past, t = daily_page(day, cursor)
+            except (ClientError, FeedBudgetSpent) as e:
+                if not pages and isinstance(e, ClientError):
+                    raise
+                tally[f"stopped:{type(e).__name__}"] += 1
+                break
+            pages += 1
+            tally.update(t)
+            new = {m["id"] for m in following} - seen
+            seen |= new
+            dry = 0 if new else dry + 1
+            cursor = past or nxt
+            if not cursor or dry >= 2:
+                break
     with POOL_LOCK:
         pool = read_json(POOL_FILE)
     items = sorted((v["m"] for v in pool.values()), key=lambda m: m["taken_at"], reverse=True)
-    log.info("daily following pages=%d pool=%d %s", pages, len(items), dict(tally))
-    return {"items": items}
+    if gather:
+        log.info("daily following pages=%d pool=%d used=%d %s", pages, len(items), timeline_used(day), dict(tally))
+    return {"items": items, "gathered": ig.state().get("following_gathered") == day}
 
 
 def reels_media(cl, user_ids):
@@ -860,40 +1070,63 @@ def reels_media(cl, user_ids):
     return list((cl.private_request("feed/reels_media/", data).get("reels") or {}).values())
 
 
-def tray_entry(reel):
+WATCHED = {"day": None, "owners": set()}  # whose stories you watched here today
+
+
+def watched(day: str) -> set:
+    if WATCHED["day"] != day:
+        WATCHED.update(day=day, owners=set())
+    return WATCHED["owners"]
+
+
+def tray_entry(reel, seen_here: set):
     u = reel.get("user") or {}
     fs = u.get("friendship_status") or {}
     if reel.get("reel_type", "user_reel") != "user_reel" or fs.get("following") is False or not u.get("username"):
         return None
     if reel.get("muted") or fs.get("is_muting_reel"):  # stories you've muted
         return None
-    if str(u.get("pk") or u.get("pk_id")) == ig.user_id:
+    pk = str(u.get("pk") or u.get("pk_id"))
+    if pk == ig.user_id:
         return None
-    unseen = (reel.get("seen") or 0) < (reel.get("latest_reel_media") or 0)
+    if reel.get("items") and ig.peek(f"stories:{pk}") is None:  # the stories came along: opening them needs no request
+        try:
+            ig.put(f"stories:{pk}", 120, stories_from_items(reel["items"]))
+        except Exception:
+            pass
+    unseen = (reel.get("seen") or 0) < (reel.get("latest_reel_media") or 0) and pk not in seen_here
     return {**raw_user(u), "unseen": unseen}
 
 
+TRAY_REST_FAILED = set()
+TRAY_REFRESHED = [0.0]
+
+
 @app.get("/api/daily/stories")
-def daily_stories():
+def daily_stories(fresh: bool = False):
     require_daily_open()
     day = local_now().date().isoformat()
+    if fresh and time.monotonic() - TRAY_REFRESHED[0] > FEED_REFRESH_GAP:
+        TRAY_REFRESHED[0] = time.monotonic()
+        ig.forget(f"daily:tray:{day}", f"daily:reels:{day}")
     raw = ig.cached(f"daily:tray:{day}", 600, lambda cl: cl.get_reels_tray_feed("cold_start"))
     reels = list(raw.get("tray") or [])
     # The tray's first page is new stories only; the people you've already
     # watched come as bare ids. Fetch up to 100 of them so you can rewatch.
     rest = [r for r in raw.get("remaining_reel_ids_to_fetch") or [] if str(r).isdigit()][:100]
-    for i in range(0, len(rest), 50):
+    for i in range(0, len(rest) if day not in TRAY_REST_FAILED else 0, 50):
         chunk = rest[i : i + 50]
         try:  # an extra: if it fails, still show the new ones
-            reels += ig.cached(f"daily:reels:{day}:{i}", 600, reels_media, chunk, soft=True)
+            reels += ig.cached(f"daily:reels:{day}:{','.join(map(str, chunk))}", 600, reels_media, chunk, soft=True)
         except ClientError as e:
+            TRAY_REST_FAILED.add(day)  # don't keep asking today
             log.warning("daily tray: reels_media failed: %s: %s", type(e).__name__, str(e)[:200])
             break
-    out, seen_ids = [], set()
+    out, ids, seen_here = [], set(), watched(day)
     for reel in reels:
-        e = tray_entry(reel)
-        if e and e["id"] not in seen_ids:
-            seen_ids.add(e["id"])
+        e = tray_entry(reel, seen_here)
+        if e and e["id"] not in ids:
+            ids.add(e["id"])
             out.append(e)
     out.sort(key=lambda x: not x["unseen"])  # new ones first, like the real app
     log.info("daily tray first=%d rest=%d shown=%d unseen=%d", len(raw.get("tray") or []), len(rest), len(out), sum(x["unseen"] for x in out))
@@ -943,7 +1176,7 @@ def answer_request(user_id: str, body: Decision):
 
 @app.get("/api/p/{media_pk}")
 def post(media_pk: str):
-    return media_full(ig.cached(f"media:{media_pk}", 120, lambda cl: cl.media_info_v1(media_pk)))
+    return media_full(ig.cached(f"media:{media_pk}", 120, media_info, media_pk))
 
 
 @app.get("/api/c/{code}")
@@ -963,7 +1196,9 @@ def mute(user_id: str, body: Mute):
         ig.run(lambda cl: cl.mute_posts_from_follow(user_id, revert=not body.posts), kind="other")
     if body.stories is not None:
         ig.run(lambda cl: cl.mute_stories_from_follow(user_id, revert=not body.stories), kind="other")
-    ig.forget("user:", "daily:")
+    ig.forget("user:", "daily:tray:", "daily:reels:")
+    if body.posts:
+        pool_forget_user(user_id)
     return {"ok": True}
 
 
@@ -1029,7 +1264,8 @@ class Like(BaseModel):
 
 @app.post("/api/p/{media_pk}/like")
 def like(media_pk: str, body: Like):
-    ig.run(lambda cl: cl.media_like(body.media_id, revert=not body.like), kind="like")
+    if not ig.run(lambda cl: cl.media_like(body.media_id, revert=not body.like), kind="like"):
+        return err(502, "instagram", "Instagram didn't take the like. Try again.")
     ig.forget(f"media:{media_pk}", "mine:liked")
     pool_update(media_pk, liked=body.like)
     return {"liked": body.like}
@@ -1042,10 +1278,10 @@ def like(media_pk: str, body: Like):
 def inbox(requests: bool = False):
     my_id = ig.user_id
     if requests:
-        threads = ig.cached("inbox:requests", 10, lambda cl: cl.direct_pending_inbox(20))
+        threads = ig.cached("inbox:requests", 10, lambda cl: cl.direct_pending_chunk()[0])
     else:
         # 20 threads = one page; we only show each thread's latest message.
-        threads = ig.cached("inbox:main", 10, lambda cl: cl.direct_threads(20, thread_message_limit=1))
+        threads = ig.cached("inbox:main", 10, lambda cl: cl.direct_threads_chunk(thread_message_limit=1)[0])
     return [thread_json(t, my_id) for t in threads]
 
 
@@ -1056,7 +1292,8 @@ def thread(thread_id: str, n: int = 20):  # Instagram pages messages by 20
     t = ig.cached(f"thread:{thread_id}:{n}", 4, lambda cl: cl.direct_thread(int(thread_id), amount=n))
     messages = sorted(t.messages, key=lambda m: m.timestamp)
     if not t.pending and thread_unread(t, my_id):
-        ig.run(lambda cl: cl.direct_send_seen(int(thread_id)), kind="seen")
+        last = max(t.messages, key=lambda m: m.timestamp)  # instagrapi's direct_send_seen refetches the thread first
+        ig.run(lambda cl: cl.direct_message_seen(int(thread_id), int(last.id)), kind="seen")
         ig.forget("inbox:")
     return {**thread_json(t, my_id), "messages": [message_json(m, my_id) for m in messages], "n": n}
 

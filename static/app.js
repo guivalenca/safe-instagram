@@ -169,7 +169,6 @@ function Link({ href, warm, children, ...rest }) {
   return html`<a
     href=${href}
     ...${rest}
-    onPointerDown=${warm}
     onClick=${(e) => {
       if (e.metaKey || e.ctrlKey) return;
       e.preventDefault();
@@ -309,11 +308,14 @@ function count(n) {
 function usePullToRefresh(refresh) {
   const [pull, setPull] = useState(0);
   const [busy, setBusy] = useState(false);
+  const running = useRef(false);
   useEffect(() => {
     let startY = null;
     let dist = 0;
     const down = (e) => {
-      startY = window.scrollY <= 0 ? e.touches[0].clientY : null;
+      // Overlays (stories, sheets) have their own swipe-down; and one refresh at a time.
+      const overlay = e.target.closest?.(".stories, .sheet-backdrop");
+      startY = window.scrollY <= 0 && !overlay && !running.current ? e.touches[0].clientY : null;
       dist = 0;
     };
     const move = (e) => {
@@ -325,10 +327,15 @@ function usePullToRefresh(refresh) {
       if (startY == null) return;
       startY = null;
       setPull(0);
-      if (dist * 0.5 > 55) {
+      if (dist * 0.5 > 55 && !running.current) {
+        running.current = true;
         setBusy(true);
-        await refresh();
-        setBusy(false);
+        try {
+          await refresh();
+        } finally {
+          running.current = false;
+          setBusy(false);
+        }
       }
     };
     window.addEventListener("touchstart", down, { passive: true });
@@ -473,9 +480,9 @@ function Search({ initial }) {
   useEffect(() => {
     const t = setTimeout(() => {
       const v = q.trim();
-      setTerm(v);
+      setTerm(v.length >= 2 ? v : "");
       history.replaceState(history.state, "", v ? `/?q=${encodeURIComponent(v)}` : "/");
-    }, 200);
+    }, 450);
     return () => clearTimeout(t);
   }, [q]);
   const key = term ? `/api/search?q=${encodeURIComponent(term.toLowerCase())}` : null;
@@ -622,7 +629,7 @@ const SEEN_REQUESTS_KEY = "seen-requests";
 const seenRequests = () => new Set(JSON.parse(localStorage.getItem(SEEN_REQUESTS_KEY) || "[]"));
 
 // Who you both know. The requests list doesn't always say, so ask their profile
-// (the same call as opening it) for the first few.
+// (the same call as opening it) for the first 3.
 function RequestSocial({ u, look }) {
   const p = useQuery(look && !u.social ? `/api/u/${encodeURIComponent(u.username)}` : null, 10 * 60000).data;
   const text = u.social || p?.social;
@@ -637,14 +644,17 @@ function Requests() {
     if (data) localStorage.setItem(SEEN_REQUESTS_KEY, JSON.stringify(data.map((u) => u.id)));
   }, [data]);
   const answer = async (u, approve) => {
-    const before = store.get(key).data;
-    setData(key, before.filter((x) => x.id !== u.id));
+    setData(key, store.get(key).data.filter((x) => x.id !== u.id));
     try {
       await api(`/api/requests/${u.id}`, { method: "POST", body: { approve } });
+      const pk = `/api/u/${encodeURIComponent(u.username)}`;
+      const prof = store.get(pk)?.data;
+      if (prof?.rel) setData(pk, { ...prof, rel: { ...prof.rel, incoming: false, followed_by: approve } });
+      if (approve) bumpMine("followers", 1);
       if (approve) toast(`@${u.username} can now see your posts`);
-      dropData(`/api/u/${encodeURIComponent(me.username)}`);
     } catch (e) {
-      setData(key, before);
+      const now = store.get(key)?.data || [];
+      if (!now.some((x) => x.id === u.id)) setData(key, [u, ...now]); // only this one comes back
       toast(e.message);
     }
   };
@@ -665,7 +675,7 @@ function Requests() {
                 <span class="row-text">
                   <${Name} u=${u} />
                   <small class="muted">${u.name}</small>
-                  <${RequestSocial} u=${u} look=${i < 10} />
+                  <${RequestSocial} u=${u} look=${i < 3} />
                 </span>
               <//>
               <div class="row-actions">
@@ -696,6 +706,29 @@ function Highlights({ userId, username }) {
   </div>`;
 }
 
+/* A post changed (like/save): update every copy the app keeps, so the post page,
+   Today and your Saved/Liked tabs agree. */
+function patchPost(nm) {
+  const page = store.get(`/api/p/${nm.id}`)?.data;
+  if (page) setData(`/api/p/${nm.id}`, { ...page, liked: nm.liked, likes: nm.likes, saved: nm.saved });
+  for (const [which, on] of [["saved", nm.saved], ["liked", nm.liked]]) {
+    for (const k of [...store.keys()].filter((k) => k.startsWith(`/api/me/${which}`))) {
+      const d = store.get(k).data;
+      if (!d?.items) continue;
+      const has = d.items.some((t) => t.id === nm.id);
+      if (!on && has) setData(k, { ...d, items: d.items.filter((t) => t.id !== nm.id) });
+      if (on && !has && k === `/api/me/${which}`) setData(k, { ...d, items: [{ id: nm.id, thumb: nm.items[0]?.img, type: nm.type }, ...d.items] });
+    }
+  }
+}
+
+// Your own profile's counts after you follow, unfollow or approve someone.
+function bumpMine(field, by) {
+  const k = `/api/u/${encodeURIComponent(me.username)}`;
+  const mine = store.get(k)?.data;
+  if (mine && mine[field] != null) setData(k, { ...mine, [field]: Math.max(0, mine[field] + by) });
+}
+
 async function mute(p, key, what) {
   const before = store.get(key)?.data;
   const rel = { ...p.rel };
@@ -713,6 +746,7 @@ async function mute(p, key, what) {
 async function follow(p, key, on) {
   const before = store.get(key)?.data;
   const followingNow = on && !p.private;
+  const wasFollowing = p.rel.following;
   setData(key, {
     ...p,
     rel: { ...p.rel, following: followingNow, requested: on && p.private },
@@ -721,7 +755,8 @@ async function follow(p, key, on) {
   try {
     const rel = await api(`/api/u/${p.id}/follow`, { method: "POST", body: { follow: on } });
     const cur = store.get(key).data;
-    setData(key, { ...cur, rel, can_see: cur.me || !cur.private || rel.following });
+    setData(key, { ...cur, rel: { ...cur.rel, ...rel }, can_see: cur.me || !cur.private || rel.following });
+    if (rel.following !== wasFollowing) bumpMine("following", rel.following ? 1 : -1);
   } catch (e) {
     setData(key, before);
     toast(e.message);
@@ -739,11 +774,15 @@ function ProfileActions({ p, k, onUnfollow }) {
     const before = store.get(k).data;
     setData(k, { ...before, rel: { ...r, incoming: false, followed_by: approve } });
     const reqs = store.get("/api/requests")?.data;
+    const row = reqs?.find((u) => u.id === p.id);
     if (reqs) setData("/api/requests", reqs.filter((u) => u.id !== p.id));
     try {
       await api(`/api/requests/${p.id}`, { method: "POST", body: { approve } });
+      if (approve) bumpMine("followers", 1);
     } catch (e) {
       setData(k, before);
+      const now = store.get("/api/requests")?.data;
+      if (row && now && !now.some((u) => u.id === row.id)) setData("/api/requests", [row, ...now]);
       toast(e.message);
     }
   };
@@ -849,25 +888,33 @@ function PostCard({ m, onChange, showTime = false }) {
   const [panel, setPanel] = useState(null); // "comments" | "share"
   const lastTap = useRef(0);
 
+  const latest = useRef(m);
+  latest.current = m;
+  const change = (patch) => {
+    const nm = { ...latest.current, ...patch };
+    latest.current = nm;
+    onChange(nm);
+    patchPost(nm);
+  };
+
   const save = async (on) => {
-    const before = m;
-    onChange({ ...m, saved: on });
+    change({ saved: on });
     try {
       await api(`/api/p/${m.id}/save`, { method: "POST", body: { media_id: m.media_id, save: on } });
       toast(on ? "Saved" : "Removed from saved");
     } catch (e) {
-      onChange(before);
+      change({ saved: !on }); // undo just this, keeping anything else that changed meanwhile
       toast(e.message);
     }
   };
 
   const like = async (on) => {
-    const before = m;
-    onChange({ ...m, liked: on, likes: m.likes == null ? null : m.likes + (on ? 1 : -1) });
+    const step = (yes) => ({ liked: yes, likes: latest.current.likes == null ? null : latest.current.likes + (yes ? 1 : -1) });
+    change(step(on));
     try {
       await api(`/api/p/${m.id}/like`, { method: "POST", body: { media_id: m.media_id, like: on } });
     } catch (e) {
-      onChange(before);
+      change(step(!on));
       toast(e.message);
     }
   };
@@ -1011,17 +1058,25 @@ function Stories({ username, highlight, user, onClose }) {
   const [progress, setProgress] = useState(0);
   const [drag, setDrag] = useState(0);
   const [liked, setLiked] = useState({});
+  const isLiked = (st) => liked[st.id] ?? !!st.liked;
+  const reachedEnd = useRef(false);
   const [replying, setReplying] = useState(false);
   const [reply, setReply] = useState("");
-  const seen = useRef(new Set());
+  const seen = useRef(new Map()); // story id -> what Instagram needs to mark it watched
   const video = useRef();
   const elapsed = useRef(0);
   const gesture = useRef(null);
   const cur = items?.[i];
 
+  const sendSeen = () => {
+    if (highlight || !seen.current.size) return;
+    api("/api/stories/seen", { method: "POST", body: { items: [...seen.current.values()], done: reachedEnd.current } }).catch(() => {});
+    seen.current = new Map();
+  };
+  useEffect(() => sendSeen, []); // the Today timer ending or leaving also closes it
   const close = () => {
-    if (!highlight && seen.current.size) api("/api/stories/seen", { method: "POST", body: { ids: [...seen.current] } }).catch(() => {});
-    if (onClose) onClose();
+    sendSeen();
+    if (onClose) onClose(reachedEnd.current);
     else back(`/u/${encodeURIComponent(username)}`);
   };
   const next = () => (items && i < items.length - 1 ? setI(i + 1) : close());
@@ -1030,7 +1085,8 @@ function Stories({ username, highlight, user, onClose }) {
   useEffect(() => {
     elapsed.current = 0;
     setProgress(0);
-    if (cur) seen.current.add(cur.id);
+    if (cur?.media_id) seen.current.set(cur.id, { media_id: cur.media_id, taken_at: cur.taken_at });
+    if (items && i === items.length - 1) reachedEnd.current = true;
     const n = items?.[i + 1];
     if (n?.img) new Image().src = n.img;
   }, [i, cur?.id]);
@@ -1064,10 +1120,13 @@ function Stories({ username, highlight, user, onClose }) {
 
   const mineStory = prof?.id && prof.id === me.id;
   const likeStory = async () => {
-    const on = !liked[cur.id];
+    const on = !isLiked(cur);
     setLiked((x) => ({ ...x, [cur.id]: on }));
     try {
       await api("/api/stories/like", { method: "POST", body: { media_id: cur.media_id, like: on } });
+      const sk = `/api/u/${cur.owner}/stories`;
+      const list = store.get(sk)?.data;
+      if (list) setData(sk, list.map((x) => (x.id === cur.id ? { ...x, liked: on } : x)));
     } catch (e) {
       setLiked((x) => ({ ...x, [cur.id]: !on }));
       toast(e.message);
@@ -1152,7 +1211,7 @@ function Stories({ username, highlight, user, onClose }) {
             />
             ${replying
               ? html`<button class="send-reply" disabled=${!reply.trim()}>Send</button>`
-              : html`<button type="button" class=${`icon story-like ${liked[cur.id] ? "on" : ""}`} onClick=${likeStory}>${I.heart}</button>`}
+              : html`<button type="button" class=${`icon story-like ${isLiked(cur) ? "on" : ""}`} onClick=${likeStory}>${I.heart}</button>`}
           </form>`}
         `}
   </div>`;
@@ -1192,25 +1251,37 @@ function Countdown({ deadline, onEnd }) {
   return html`<span class=${`timer ${left < 30000 ? "low" : ""}`}>${clock(left)}</span>`;
 }
 
+// What Today showed, so coming back from a profile or a post doesn't start over
+// (and doesn't ask the server for the same pages again).
+let todayKeep = null;
+
 function Today() {
-  const [st, setSt] = useState(null);
-  const [deadline, setDeadline] = useState(null);
-  const [stories, setStories] = useState(null);
-  const [tab, setTab] = useState("feed");
-  const [posts, setPosts] = useState(null); // Instagram's feed, a page at a time
-  const [next, setNext] = useState(null);
+  const kept = todayKeep && todayKeep.deadline > Date.now() ? todayKeep : null;
+  const [st, setSt] = useState(kept?.st ?? null);
+  const [deadline, setDeadline] = useState(kept?.deadline ?? null);
+  const [stories, setStories] = useState(kept?.stories ?? null);
+  const [tab, setTab] = useState(kept?.tab ?? "feed");
+  const [posts, setPosts] = useState(kept?.posts ?? null); // Instagram's feed, a page at a time
+  const [next, setNext] = useState(kept?.next ?? null);
   const [loading, setLoading] = useState(false);
   const [nearEnd, setNearEnd] = useState(false);
-  const [following, setFollowing] = useState(null); // people you follow, newest first
+  const [following, setFollowing] = useState(kept?.following ?? null); // people you follow, newest first
+  const [gathered, setGathered] = useState(kept?.gathered ?? false);
+  const [spent, setSpent] = useState(kept?.spent ?? false);
   const [viewer, setViewer] = useState(null);
   const [error, setError] = useState(null);
   const sentinel = useRef();
+  const shown = useRef(new Set(kept?.shown ?? [])); // feed posts already on screen
+  const lastLoad = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => () => (mounted.current = false), []);
 
   const apply = (x) => {
     setSt(x);
     setDeadline(x.status === "open" ? Date.now() + x.remaining * 1000 : null);
   };
   const end = useCallback(() => {
+    todayKeep = null;
     setViewer(null);
     setPosts(null);
     setFollowing(null);
@@ -1222,48 +1293,87 @@ function Today() {
   const fail = (e) => (e.code === "daily_over" ? end() : setError(e));
 
   useEffect(() => {
-    api("/api/daily").then(apply).catch(setError);
+    if (!kept) api("/api/daily").then(apply).catch(setError);
   }, []);
+
+  useEffect(() => {
+    if (st?.status === "open") todayKeep = { st, deadline, stories, tab, posts, next, following, gathered, spent, shown: [...shown.current] };
+  }, [st, deadline, stories, tab, posts, next, following, gathered, spent]);
 
   const load = (cursor) => {
     setLoading(true);
+    lastLoad.current = Date.now();
     return api(`/api/daily/feed${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`)
       .then((r) => {
-        setPosts((p) => {
-          const have = new Set((p || []).map((x) => x.id));
-          return [...(p || []), ...r.items.filter((m) => !have.has(m.id))];
-        });
-        setNext(r.next);
+        if (!mounted.current) return; // left meanwhile: the page stays cached for when you're back
+        const fresh = r.items.filter((m) => !shown.current.has(m.id));
+        fresh.forEach((m) => shown.current.add(m.id));
+        setPosts((p) => [...(p || []), ...fresh]);
+        if (r.spent) setSpent(true);
+        // Never ask again on our own after a page that added nothing: the
+        // sentinel would still be on screen and we'd loop.
+        setNext(fresh.length || !cursor ? r.next : null);
       })
-      .catch(fail)
+      .catch((e) => (setNext(null), fail(e)))
       .finally(() => setLoading(false));
   };
 
   useEffect(() => {
-    if (st?.status !== "open") return;
-    api("/api/daily/stories").then(setStories).catch(() => setStories([]));
-    load(null);
+    if (st?.status === "open" && posts === null) load(null);
+  }, [st?.status]);
+  // The tray after the first posts: its slower part shouldn't hold them up.
+  useEffect(() => {
+    if (st?.status === "open" && stories === null) api("/api/daily/stories").then((x) => mounted.current && setStories(x)).catch(() => mounted.current && setStories([]));
   }, [st?.status]);
 
-  // Following is only gathered if you open it.
+  // Following: what's stored shows at once; new posts are gathered once a day.
   useEffect(() => {
-    if (st?.status !== "open" || tab !== "following" || following) return;
-    api("/api/daily/following")
-      .then((r) => setFollowing(r.items))
-      .catch(fail);
+    if (st?.status !== "open" || tab !== "following") return;
+    if (following === null) api("/api/daily/following").then((r) => (setFollowing(r.items), setGathered(r.gathered))).catch(fail);
+    if (!gathered)
+      api("/api/daily/following?gather=1")
+        .then((r) => (setFollowing(r.items), setGathered(true)))
+        .catch(fail);
   }, [st?.status, tab]);
 
-  // Keep a page ahead: start loading well before you reach the bottom.
+  // Load the next page a little before you reach the bottom, at most every 2.5s.
   useEffect(() => {
     const el = sentinel.current;
     if (!el) return;
-    const io = new IntersectionObserver(([e]) => setNearEnd(e.isIntersecting), { rootMargin: "2500px 0px" });
+    const io = new IntersectionObserver(([e]) => setNearEnd(e.isIntersecting), { rootMargin: "1200px 0px" });
     io.observe(el);
     return () => io.disconnect();
   }, [posts !== null, tab]);
   useEffect(() => {
-    if (tab === "feed" && nearEnd && next && !loading) load(next);
+    if (tab !== "feed" || !nearEnd || !next || loading) return;
+    const wait = 2500 - (Date.now() - lastLoad.current);
+    const t = setTimeout(() => load(next), Math.max(0, wait));
+    return () => clearTimeout(t);
   }, [tab, nearEnd, next, loading]);
+
+  const ptr = usePullToRefresh(
+    useCallback(async () => {
+      api("/api/daily/stories?fresh=1").then(setStories).catch(() => {});
+      try {
+        if (tab === "following") {
+          setFollowing((await api("/api/daily/following")).items);
+          return;
+        }
+        const r = await api("/api/daily/feed?fresh=1");
+        if (r.spent) {
+          setSpent(true);
+          toast("That's enough feed for today");
+          return;
+        }
+        shown.current = new Set(r.items.map((m) => m.id));
+        lastLoad.current = Date.now();
+        setPosts(r.items);
+        setNext(r.next);
+      } catch (e) {
+        fail(e);
+      }
+    }, [tab])
+  );
 
   const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
   const update = useCallback((nm) => {
@@ -1306,6 +1416,7 @@ function Today() {
   const card = (m) => html`<${PostCard} key=${m.id} m=${m} onChange=${update} showTime=${true} />`;
   return html`<div class="page">
     <${TopBar} left=${html`<span></span>`} title="Today" right=${deadline && html`<${Countdown} deadline=${deadline} onEnd=${end} />`} />
+    ${ptr}
     ${stories?.length > 0 &&
     html`<div class="tray">
       ${stories.map(
@@ -1322,23 +1433,30 @@ function Today() {
     ${tab === "following"
       ? following === null
         ? html`<div class="gathering"><${Spinner} /><small class="muted">Gathering posts from people you follow…</small></div>`
-        : !following.length
-        ? html`<${Empty}><p class="muted">Nothing from people you follow this week.</p><//>`
-        : html`${following.map(card)}<p class="caught-up muted">${I.check} That's the last 7 days</p>`
+        : html`${!gathered && html`<div class="gathering"><${Spinner} /><small class="muted">Looking for new posts…</small></div>`}
+          ${!following.length
+            ? gathered && html`<${Empty}><p class="muted">Nothing from people you follow this week.</p><//>`
+            : html`${following.map(card)}<p class="caught-up muted">${I.check} That's the last 7 days</p>`}`
       : html`${posts === null
           ? html`<${Spinner} />`
           : !posts.length && !next && !loading
-          ? html`<${Empty}><p class="muted">Nothing in your feed right now.</p><//>`
+          ? html`<${Empty}><p class="muted">${spent ? "That's enough feed for today." : "Nothing in your feed right now."}</p><//>`
           : posts.map(card)}
         <div ref=${sentinel} class="sentinel"></div>
-        ${posts !== null && (next || loading) ? html`<${Spinner} />` : posts?.length > 0 && html`<p class="caught-up muted">${I.check} That's everything for now</p>`}`}
+        ${posts !== null && (next || loading)
+          ? html`<${Spinner} />`
+          : posts?.length > 0 && html`<p class="caught-up muted">${I.check} ${spent ? "That's enough feed for today" : "That's everything for now. Pull down for new posts."}</p>`}`}
     ${viewer &&
     html`<${Stories}
       key=${viewer.id}
       username=${viewer.username}
       user=${viewer}
-      onClose=${() => {
-        setStories((list) => list.map((x) => (x.id === viewer.id ? { ...x, unseen: false } : x)));
+      onClose=${(watchedAll) => {
+        setStories((list) => {
+          if (!watchedAll) return list; // stopped partway: still has stories you haven't seen
+          const marked = list.map((x) => (x.id === viewer.id ? { ...x, unseen: false } : x));
+          return [...marked.filter((x) => x.unseen), ...marked.filter((x) => !x.unseen)];
+        });
         setViewer(null);
       }}
     />`}
@@ -1529,13 +1647,28 @@ function Thread({ id }) {
   const list = useRef();
   const stick = useRef(true);
 
-  // Light polling while you're looking at the conversation, then it rests.
+  // Light polling while you're in the conversation: every 10s, slowing to once a
+  // minute while nothing new arrives, and resting 2 minutes after you last did
+  // anything. Not while older messages are loaded: each poll would refetch them all.
   useEffect(() => {
-    const t = setInterval(() => {
-      if (document.visibilityState === "visible" && Date.now() - active.current < 3 * 60000) refresh();
-    }, 6000);
-    return () => clearInterval(t);
-  }, [refresh]);
+    if (n !== 20) return;
+    let gap = 10000;
+    let last = store.get(key)?.data?.messages?.at(-1)?.id;
+    let t;
+    let stopped = false;
+    const tick = async () => {
+      if (stopped) return;
+      if (document.visibilityState === "visible" && Date.now() - active.current < 2 * 60000) {
+        await refresh();
+        const now = store.get(key)?.data?.messages?.at(-1)?.id;
+        gap = now !== last || Date.now() - active.current < 15000 ? 10000 : Math.min(gap * 2, 60000);
+        last = now;
+      }
+      if (!stopped) t = setTimeout(tick, gap);
+    };
+    t = setTimeout(tick, gap);
+    return () => ((stopped = true), clearTimeout(t));
+  }, [refresh, n]);
 
   const msgs = data ? [...data.messages, ...outbox.filter((o) => !data.messages.some((m) => m.id === o.serverId))] : outbox;
   useEffect(() => {

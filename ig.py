@@ -8,6 +8,7 @@ Everything that talks to Instagram goes through `IG.run()`, which:
 """
 
 import datetime as dt
+import functools
 import json
 import os
 import queue
@@ -17,12 +18,15 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import requests
 from instagrapi import Client
 from instagrapi.exceptions import (
     AccountSuspended,
     ChallengeError,
     ClientError,
+    ClientConnectionError,
     ClientLoginRequired,
+    ClientNotFoundError,
     ClientThrottledError,
     ClientUnauthorizedError,
     FeedbackRequired,
@@ -121,6 +125,17 @@ def new_client() -> Client:
     return cl
 
 
+TIMEOUT = (5, 25)  # seconds to connect, to wait for an answer
+
+
+def with_timeout(cl: Client) -> Client:
+    """instagrapi sends without a timeout, so one stalled connection would freeze
+    every screen behind the lock. The transport doesn't retry, so nothing is resent."""
+    if not isinstance(cl.private.request, functools.partial):
+        cl.private.request = functools.partial(cl.private.request, timeout=TIMEOUT)
+    return cl
+
+
 def apply_timezone(cl: Client, tz_name: str):
     """Report the phone's current UTC offset (it shifts with daylight saving)."""
     try:
@@ -136,6 +151,7 @@ class IG:
         self.write_lock = threading.Lock()
         self._cl = None
         self._cache = {}  # key -> (expires_at, value)
+        self._cache_lock = threading.Lock()
         self._last_write = 0.0
         self._last_by_kind = {}
 
@@ -151,7 +167,7 @@ class IG:
                 raise NotConnected()
             if self._state().get("timezone"):
                 apply_timezone(cl, self._state()["timezone"])
-            self._cl = cl
+            self._cl = with_timeout(cl)
         return self._cl
 
     def _save(self):
@@ -159,6 +175,8 @@ class IG:
             write_private_json(SESSION_FILE, self._cl.get_settings())
 
     def connected(self) -> bool:
+        if self._cl is not None:  # no need to wait behind a call in flight
+            return True
         try:
             with self.lock:
                 self._client()
@@ -171,8 +189,9 @@ class IG:
         with self.lock:
             cl.with_challenge_flow = False
             cl.request_timeout = 0
-            self._cl = cl
-            self._cache.clear()
+            self._cl = with_timeout(cl)
+            with self._cache_lock:
+                self._cache.clear()
             self._save()
             s = self._state()
             s.update(username=username, timezone=tz_name, errors=0)
@@ -182,7 +201,8 @@ class IG:
     def disconnect(self):
         with self.lock:
             self._cl = None
-            self._cache.clear()
+            with self._cache_lock:
+                self._cache.clear()
             if SESSION_FILE.exists():
                 os.replace(SESSION_FILE, DEVICE_FILE)
 
@@ -196,17 +216,34 @@ class IG:
 
     # -- short-lived cache: collapses prefetch + tap, back/forward, refreshes --
 
-    def cached(self, key: str, ttl: float, fn, *args, **kwargs):  # kwargs go to run()
-        with self.lock:  # checked under the lock, so a duplicate request waits for the first one
+    def peek(self, key: str):
+        with self._cache_lock:
             hit = self._cache.get(key)
-            if hit and hit[0] > time.monotonic():
-                return hit[1]
+        return hit[1] if hit and hit[0] > time.monotonic() else None
+
+    def cached(self, key: str, ttl: float, fn, *args, **kwargs):  # kwargs go to run()
+        hit = self.peek(key)  # cached answers don't wait behind a call in flight
+        if hit is not None:
+            return hit
+        with self.lock:  # checked again under the lock, so a duplicate request waits for the first one
+            hit = self.peek(key)
+            if hit is not None:
+                return hit
             value = self.run(fn, *args, **kwargs)
-            self._cache[key] = (time.monotonic() + ttl, value)
+            now = time.monotonic()
+            with self._cache_lock:
+                if len(self._cache) > 300:  # drop expired entries now and then
+                    self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
+                self._cache[key] = (now + ttl, value)
             return value
 
+    def put(self, key: str, ttl: float, value):
+        """Cache something we already have (e.g. stories that came along with the tray)."""
+        with self._cache_lock:
+            self._cache[key] = (time.monotonic() + ttl, value)
+
     def forget(self, *prefixes: str):
-        with self.lock:
+        with self._cache_lock:
             for k in [k for k in self._cache if k.startswith(prefixes)]:
                 del self._cache[k]
 
@@ -255,6 +292,10 @@ class IG:
 
     def _spend(self, kind: str):
         """Check and record an action against its hourly/daily limits."""
+        with self.lock:  # every other state.json write happens under it
+            self._spend_locked(kind)
+
+    def _spend_locked(self, kind: str):
         _, per_hour, per_day = LIMITS[kind]
         s = self._state()
         now = time.time()
@@ -303,12 +344,21 @@ class IG:
             finally:
                 self._last_write = self._last_by_kind[kind] = time.monotonic()
 
+    @staticmethod
+    def _guarded(fn, cl, args, kwargs):
+        """A timeout or dropped connection comes out of instagrapi as a plain
+        requests error; make it an Instagram error so it's handled and counted."""
+        try:
+            return fn(cl, *args, **kwargs)
+        except requests.exceptions.RequestException as e:
+            raise ClientConnectionError(f"{type(e).__name__}: {e}") from e
+
     def _call(self, fn, args, kwargs, write, soft=False):
         with self.lock:
             self._check_cooldown(write)
             cl = self._client()
             try:
-                result = fn(cl, *args, **kwargs)
+                result = self._guarded(fn, cl, args, kwargs)
             except (LoginRequired, ClientLoginRequired, ClientUnauthorizedError, ChallengeError) as e:
                 # Don't log back in automatically: repeated automatic logins
                 # are exactly what gets accounts flagged. The app asks you.
@@ -327,7 +377,7 @@ class IG:
             except (PleaseWaitFewMinutes, RateLimitError, ClientThrottledError):
                 self._start_cooldown(COOLDOWN_SOFT, "Instagram asked us to slow down", writes_only=False)
                 raise
-            except (NotFoundError, PrivateAccount):
+            except (NotFoundError, ClientNotFoundError, PrivateAccount):
                 raise  # normal answers, not trouble
             except ClientError:
                 if soft:
