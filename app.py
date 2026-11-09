@@ -630,14 +630,38 @@ def mark_stories_seen(cl, items):
     return True
 
 
+# "Watched" reports wait a few seconds and go out together: sent at once, each
+# would hold the Instagram lock just as you tap the next person's stories.
+SEEN_DELAY = 4.0
+SEEN = {"items": {}, "timer": None}
+SEEN_LOCK = threading.Lock()
+
+
+def flush_seen():
+    with SEEN_LOCK:
+        items = list(SEEN["items"].values())
+        SEEN.update(items={}, timer=None)
+    if not items:
+        return
+    try:
+        ok = ig.run(mark_stories_seen, items, kind="seen")
+    except Exception:  # disconnected meanwhile: nothing to tell Instagram
+        ok = False
+    log.info("stories seen sent=%d ok=%s", len(items), bool(ok))
+
+
 @app.post("/api/stories/seen")
 def stories_seen(body: SeenStories):
     items = [it for it in body.items if "_" in it.media_id]
     if items:
-        ok = ig.run(mark_stories_seen, items, kind="seen")
-        log.info("stories seen sent=%d ok=%s", len(items), bool(ok))
         if body.done:  # stopping partway leaves them unwatched in the tray, as Instagram does
             watched(local_now().date().isoformat()).update(it.media_id.split("_")[-1] for it in items)
+        with SEEN_LOCK:
+            SEEN["items"].update({it.media_id: it for it in items})
+            if SEEN["timer"] is None:
+                SEEN["timer"] = threading.Timer(SEEN_DELAY, flush_seen)
+                SEEN["timer"].daemon = True
+                SEEN["timer"].start()
     return {"ok": True}
 
 
@@ -659,6 +683,8 @@ def follow_request(cl, user_id: str, follow: bool) -> dict:
 def follow(user_id: str, body: Follow):
     fs = ig.run(follow_request, user_id, body.follow, kind="follow")
     ig.forget("user:")
+    if not body.follow:
+        tray_forget(user_id)
     return {"following": bool(fs.get("following")), "followed_by": bool(fs.get("followed_by")), "requested": bool(fs.get("outgoing_request"))}
 
 
@@ -769,11 +795,11 @@ def feed_verdict(media: dict) -> str:
     return "keep" if fs.get("following") else "not_following"
 
 
-def timeline_page(cl, max_id):
+def timeline_page(cl, max_id, reason="cold_start_fetch"):
     """One feed/timeline request. instagrapi would report every post it has
     fetched as fully viewed, which takes them out of your feed in the official
     app too, so send no views. With a max_id it switches the reason to "pagination"."""
-    return cl.get_timeline_feed("cold_start_fetch", max_id=max_id, seen_posts=[])
+    return cl.get_timeline_feed(reason, max_id=max_id, seen_posts=[])
 
 
 def page_medias(raw: dict, tally: Counter) -> list:
@@ -841,7 +867,7 @@ def timeline_used(day: str) -> int:
     return t.get("n", 0) if t.get("day") == day else 0
 
 
-def fetch_page(day: str, max_id) -> dict:
+def fetch_page(day: str, max_id, reason="cold_start_fetch") -> dict:
     key = f"daily:feed:{day}:{max_id}"
     hit = ig.peek(key)
     if hit is not None:
@@ -857,19 +883,21 @@ def fetch_page(day: str, max_id) -> dict:
             time.sleep(wait)
         try:
             # Later pages are extras: a refusal there shouldn't count as trouble.
-            return ig.cached(key, 900, timeline_page, max_id, soft=bool(max_id))
+            return ig.cached(key, 900, timeline_page, max_id, reason, soft=bool(max_id))
         finally:
             TIMELINE_LAST[0] = time.monotonic()
+            if not max_id:  # the top of the feed was just asked for, whatever started it
+                FEED["refreshed"] = time.monotonic()
             ig.update_state(timeline={"day": day, "n": timeline_used(day) + 1})
 
 
-def daily_page(day: str, cursor: str | None):
+def daily_page(day: str, cursor: str | None, reason="cold_start_fetch"):
     """One timeline page, fetched from Instagram once (it stays cached 15 minutes).
 
     Returns the page's posts as Instagram ordered them, the ids among them that
     are ads, and where the feed goes next.
     """
-    raw = fetch_page(day, cursor)
+    raw = fetch_page(day, cursor, reason)
     tally = Counter()
     shown, ads = [], set()
     for media in page_medias(raw, tally):
@@ -885,8 +913,8 @@ def daily_page(day: str, cursor: str | None):
     return shown, ads, more or None, tally
 
 
-FEED_REFRESH_GAP = 30  # seconds between pull-to-refreshes that actually ask Instagram
-FEED = {"day": None, "served": set(), "dry": 0, "refreshed": 0.0}
+FEED_REFRESH_GAP = 30  # seconds after the top of the feed was fetched before a pull-to-refresh asks Instagram again
+FEED = {"day": None, "served": set(), "dry": 0, "refreshed": -1e9}
 
 
 @app.get("/api/daily/feed")
@@ -896,20 +924,26 @@ def daily_feed(cursor: str = "", fresh: bool = False):
     Past "You're all caught up" Instagram can keep answering with the same few
     posts (plus a new ad) under a new cursor; two pages in a row with nothing new
     but ads end the feed.
+
+    fresh=1 is a pull-to-refresh: it asks Instagram for the top of the feed again
+    (saying it's a pull, as the app does) unless that was done in the last
+    FEED_REFRESH_GAP seconds; then "wait" says how long until it will.
     """
     require_daily_open()
     day = local_now().date().isoformat()
     if FEED["day"] != day:
-        FEED.update(day=day, served=set(), dry=0, refreshed=0.0)
+        FEED.update(day=day, served=set(), dry=0)
+    wait = 0
     if not cursor:  # a new pass through the feed
-        if fresh and timeline_used(day) < TIMELINE_DAILY_MAX and time.monotonic() - FEED["refreshed"] > FEED_REFRESH_GAP:
-            FEED["refreshed"] = time.monotonic()
-            ig.forget(f"daily:feed:{day}:None")
+        if fresh and timeline_used(day) < TIMELINE_DAILY_MAX:
+            wait = FEED_REFRESH_GAP - (time.monotonic() - FEED["refreshed"])
+            if wait <= 0:
+                ig.forget(f"daily:feed:{day}:None")
         FEED.update(served=set(), dry=0)
     elif FEED["dry"] >= 2:
         return {"items": [], "next": None}
     try:
-        shown, ads, nxt, tally = daily_page(day, cursor or None)
+        shown, ads, nxt, tally = daily_page(day, cursor or None, "pull_to_refresh" if fresh else "cold_start_fetch")
     except FeedBudgetSpent:
         log.info("daily feed: today's %d pages are used", TIMELINE_DAILY_MAX)
         return {"items": [], "next": None, "spent": True}
@@ -923,7 +957,7 @@ def daily_feed(cursor: str = "", fresh: bool = False):
     done = not nxt or FEED["dry"] >= 2
     # Counts only, no content: lets us tune this from the logs.
     log.info("daily feed page=%s shown=%d new=%d used=%d %s", "next" if cursor else "first", len(shown), len(new), timeline_used(day), dict(tally))
-    return {"items": shown, "next": None if done else nxt}
+    return {"items": shown, "next": None if done else nxt, "wait": max(0, int(wait + 0.999))}
 
 
 def reels_media(cl, user_ids):
@@ -948,27 +982,62 @@ def watched(day: str) -> set:
     return WATCHED["owners"]
 
 
-def tray_entry(reel, seen_here: set):
+def tray_entry(reel, seen_here: set, tally: Counter):
     u = reel.get("user") or {}
     fs = u.get("friendship_status") or {}
-    if reel.get("reel_type", "user_reel") != "user_reel" or fs.get("following") is False or not u.get("username"):
+    if reel.get("reel_type", "user_reel") != "user_reel" or not u.get("username"):
+        tally["not_a_person"] += 1
+        return None
+    if fs.get("following") is False:
+        tally["not_following"] += 1
         return None
     if reel.get("muted") or fs.get("is_muting_reel"):  # stories you've muted
+        tally["muted"] += 1
         return None
     pk = str(u.get("pk") or u.get("pk_id"))
     if pk == ig.user_id:
+        tally["mine"] += 1
         return None
-    if reel.get("items") and ig.peek(f"stories:{pk}") is None:  # the stories came along: opening them needs no request
-        try:
-            ig.put(f"stories:{pk}", 120, stories_from_items(reel["items"]))
-        except Exception:
-            pass
+    if reel.get("items"):  # the stories came along: opening them needs no request while the tray is cached
+        tally["with_stories"] += 1
+        if ig.peek(f"stories:{pk}") is None:
+            try:
+                ig.put(f"stories:{pk}", TRAY_TTL, stories_from_items(reel["items"]))
+            except Exception:
+                pass
     unseen = (reel.get("seen") or 0) < (reel.get("latest_reel_media") or 0) and pk not in seen_here
     return {**raw_user(u), "unseen": unseen}
 
 
+TRAY_TTL = 600
+# feed/reels_media has answered "something went wrong" every time in production,
+# so the already-watched people aren't fetched; True tries again (once a day).
+TRAY_FETCH_WATCHED = False
 TRAY_REST_FAILED = set()
-TRAY_REFRESHED = [0.0]
+TRAY_REFRESHED = [-1e9]
+
+# Everyone the tray has shown today. Once you've watched someone, Instagram's
+# tray only names them by id, so this is what keeps them at the end of yours.
+# Kept in a file, so a restart doesn't empty it.
+TRAY_FILE = DATA / "tray.json"
+TRAY_PEOPLE = {"day": None, "people": {}}
+TRAY_LOCK = threading.Lock()  # two tray requests can overlap (opening Today, then pulling)
+
+
+def tray_people(day: str) -> dict:
+    if TRAY_PEOPLE["day"] != day:
+        saved = read_json(TRAY_FILE)
+        TRAY_PEOPLE.update(day=day, people=(saved.get("people") or {}) if saved.get("day") == day else {})
+    return TRAY_PEOPLE["people"]
+
+
+def tray_forget(user_id: str):
+    """Someone you've just unfollowed or muted shouldn't stay in the tray from memory."""
+    day = local_now().date().isoformat()
+    with TRAY_LOCK:
+        people = tray_people(day)
+        if people.pop(str(user_id), None):
+            write_private_json(TRAY_FILE, {"day": day, "people": people})
 
 
 @app.get("/api/daily/stories")
@@ -978,27 +1047,38 @@ def daily_stories(fresh: bool = False):
     if fresh and time.monotonic() - TRAY_REFRESHED[0] > FEED_REFRESH_GAP:
         TRAY_REFRESHED[0] = time.monotonic()
         ig.forget(f"daily:tray:{day}", f"daily:reels:{day}")
-    raw = ig.cached(f"daily:tray:{day}", 600, lambda cl: cl.get_reels_tray_feed("cold_start"))
+    raw = ig.cached(f"daily:tray:{day}", TRAY_TTL, lambda cl: cl.get_reels_tray_feed("cold_start"))
     reels = list(raw.get("tray") or [])
     # The tray's first page is new stories only; the people you've already
-    # watched come as bare ids. Fetch up to 100 of them so you can rewatch.
-    rest = [r for r in raw.get("remaining_reel_ids_to_fetch") or [] if str(r).isdigit()][:100]
-    for i in range(0, len(rest) if day not in TRAY_REST_FAILED else 0, 50):
+    # watched come as bare ids.
+    rest = [str(r) for r in raw.get("remaining_reel_ids_to_fetch") or [] if str(r).isdigit()]
+    for i in range(0, min(len(rest), 100) if TRAY_FETCH_WATCHED and day not in TRAY_REST_FAILED else 0, 50):
         chunk = rest[i : i + 50]
         try:  # an extra: if it fails, still show the new ones
-            reels += ig.cached(f"daily:reels:{day}:{','.join(map(str, chunk))}", 600, reels_media, chunk, soft=True)
+            reels += ig.cached(f"daily:reels:{day}:{','.join(chunk)}", TRAY_TTL, reels_media, chunk, soft=True)
         except ClientError as e:
             TRAY_REST_FAILED.add(day)  # don't keep asking today
             log.warning("daily tray: reels_media failed: %s: %s", type(e).__name__, str(e)[:200])
             break
-    out, ids, seen_here = [], set(), watched(day)
+    out, ids, seen_here, tally = [], set(), watched(day), Counter()
     for reel in reels:
-        e = tray_entry(reel, seen_here)
+        e = tray_entry(reel, seen_here, tally)
         if e and e["id"] not in ids:
             ids.add(e["id"])
             out.append(e)
+    # People shown earlier today who've left the first page: you watched them
+    # (here or in the app). They stay, at the end, while Instagram still lists
+    # them among the watched; when it doesn't, their stories are gone.
     out.sort(key=lambda x: not x["unseen"])  # new ones first, like the real app
-    log.info("daily tray first=%d rest=%d shown=%d unseen=%d", len(raw.get("tray") or []), len(rest), len(out), sum(x["unseen"] for x in out))
+    with TRAY_LOCK:
+        people, watched_ids = tray_people(day), set(rest)
+        kept = [{**e, "unseen": False} for pk, e in people.items() if pk not in ids and (pk in watched_ids or not rest)]
+        out += kept
+        if any(people.get(e["id"]) != e for e in out):
+            people.update({e["id"]: e for e in out})
+            write_private_json(TRAY_FILE, {"day": day, "people": people})
+    # Counts only, no names: lets us tune this from the logs.
+    log.info("daily tray first=%d rest=%d shown=%d unseen=%d kept=%d %s", len(raw.get("tray") or []), len(rest), len(out), sum(x["unseen"] for x in out), len(kept), dict(tally))
     return out
 
 
@@ -1065,6 +1145,8 @@ def mute(user_id: str, body: Mute):
         ig.run(lambda cl: cl.mute_posts_from_follow(user_id, revert=not body.posts), kind="other")
     if body.stories is not None:
         ig.run(lambda cl: cl.mute_stories_from_follow(user_id, revert=not body.stories), kind="other")
+        if body.stories:
+            tray_forget(user_id)
     ig.forget("user:", "daily:tray:", "daily:reels:")
     return {"ok": True}
 

@@ -304,52 +304,98 @@ function count(n) {
   return n.toLocaleString();
 }
 
-/* Pull down at the top of a screen to refresh. */
+/* Pull down at the top of a screen to refresh. It has to be meant, like iOS's:
+   one finger, starting with the page resting at the very top, going clearly
+   down (not sideways, not after first scrolling up), far enough, and not a flick. */
+const PULL_SLOP = 12; // px a finger may wander before the gesture is read
+const PULL_TRIGGER = 150; // px of pull, past the slop, that refreshes on release
+const PULL_MIN_MS = 200; // quicker than this is a flick
+const PULL_AFTER_SCROLL = 400; // ms the page must have been still: no catching a scroll's momentum or bounce
+
+function pullGesture() {
+  let g = null;
+  const stop = () => ((g = null), 0);
+  return {
+    start(x, y, now) {
+      g = { x, y, now, pulling: false, dist: 0 };
+    },
+    stop,
+    /* How far it's pulled (0 when this isn't a pull). */
+    move(x, y, atTop) {
+      if (!g) return 0;
+      const dx = Math.abs(x - g.x);
+      const dy = y - g.y;
+      if (!atTop) return stop();
+      if (!g.pulling) {
+        if (dx < PULL_SLOP && Math.abs(dy) < PULL_SLOP) return 0;
+        if (dy < PULL_SLOP || dx > dy * 0.6) return stop(); // the first clear movement decides
+        g.pulling = true;
+      }
+      return (g.dist = Math.max(0, dy - PULL_SLOP));
+    },
+    /* Lifting the finger: true if that should refresh. */
+    end(now) {
+      const yes = !!g && g.pulling && g.dist >= PULL_TRIGGER && now - g.now >= PULL_MIN_MS;
+      stop();
+      return yes;
+    },
+  };
+}
+
 function usePullToRefresh(refresh) {
   const [pull, setPull] = useState(0);
   const [busy, setBusy] = useState(false);
   const running = useRef(false);
   useEffect(() => {
-    let startY = null;
-    let dist = 0;
+    const g = pullGesture();
+    let scrolled = 0;
+    const atTop = () => window.scrollY <= 0;
     const down = (e) => {
-      // Overlays (stories, sheets) have their own swipe-down; and one refresh at a time.
-      const overlay = e.target.closest?.(".stories, .sheet-backdrop");
-      startY = window.scrollY <= 0 && !overlay && !running.current ? e.touches[0].clientY : null;
-      dist = 0;
+      // Overlays (stories, sheets) have their own swipe-down, the left edge is
+      // "back", and one refresh at a time.
+      const t = e.touches[0];
+      const elsewhere = e.target.closest?.(".stories, .sheet-backdrop, .react-cover, .tabbar, input, textarea");
+      if (e.touches.length > 1 || elsewhere || running.current || !atTop() || t.clientX < 24 || Date.now() - scrolled < PULL_AFTER_SCROLL) {
+        g.stop();
+        return setPull(0);
+      }
+      g.start(t.clientX, t.clientY, Date.now());
     };
     const move = (e) => {
-      if (startY == null) return;
-      dist = Math.max(0, e.touches[0].clientY - startY);
-      setPull(Math.min(dist * 0.5, 70));
+      const t = e.touches[0];
+      setPull(e.touches.length > 1 ? g.stop() : g.move(t.clientX, t.clientY, atTop()));
     };
     const up = async () => {
-      if (startY == null) return;
-      startY = null;
       setPull(0);
-      if (dist * 0.5 > 55 && !running.current) {
-        running.current = true;
-        setBusy(true);
-        try {
-          await refresh();
-        } finally {
-          running.current = false;
-          setBusy(false);
-        }
+      if (!g.end(Date.now()) || running.current) return;
+      running.current = true;
+      setBusy(true);
+      try {
+        await refresh();
+      } finally {
+        running.current = false;
+        setBusy(false);
       }
     };
+    const cancel = () => setPull(g.stop());
+    const scroll = () => (scrolled = Date.now());
     window.addEventListener("touchstart", down, { passive: true });
     window.addEventListener("touchmove", move, { passive: true });
     window.addEventListener("touchend", up);
+    window.addEventListener("touchcancel", cancel);
+    window.addEventListener("scroll", scroll, { passive: true });
     return () => {
       window.removeEventListener("touchstart", down);
       window.removeEventListener("touchmove", move);
       window.removeEventListener("touchend", up);
+      window.removeEventListener("touchcancel", cancel);
+      window.removeEventListener("scroll", scroll);
     };
   }, [refresh]);
+  const armed = pull >= PULL_TRIGGER; // letting go now refreshes
   return pull || busy
-    ? html`<div class="ptr" style=${`height:${busy ? 44 : pull}px`}>
-        <div class=${`spinner ${busy ? "" : "still"}`} style=${`transform:rotate(${pull * 5}deg)`}></div>
+    ? html`<div class="ptr" style=${`height:${busy ? 44 : Math.min(pull * 0.4, 70)}px`}>
+        <div class=${`spinner ${busy ? "" : armed ? "still armed" : "still"}`} style=${`transform:rotate(${pull * 2}deg)`}></div>
       </div>`
     : null;
 }
@@ -1063,10 +1109,13 @@ function Stories({ username, highlight, user, onClose }) {
   const [replying, setReplying] = useState(false);
   const [reply, setReply] = useState("");
   const seen = useRef(new Map()); // story id -> what Instagram needs to mark it watched
+  const [arrived, setArrived] = useState(null); // the story whose picture or video has loaded
+  const [blocked, setBlocked] = useState(null); // the story whose picture Safari refused straight from Instagram
   const video = useRef();
   const elapsed = useRef(0);
   const gesture = useRef(null);
   const cur = items?.[i];
+  const ready = !!cur && arrived === cur.id;
 
   const sendSeen = () => {
     if (highlight || !seen.current.size) return;
@@ -1085,14 +1134,18 @@ function Stories({ username, highlight, user, onClose }) {
   useEffect(() => {
     elapsed.current = 0;
     setProgress(0);
-    if (cur?.media_id) seen.current.set(cur.id, { media_id: cur.media_id, taken_at: cur.taken_at });
     if (items && i === items.length - 1) reachedEnd.current = true;
-    const n = items?.[i + 1];
-    if (n?.img) new Image().src = n.img;
+    // The next two pictures (a video's is its first frame), so they're there when you tap.
+    for (const n of items?.slice(i + 1, i + 3) || []) if (n.img) new Image().src = n.img;
   }, [i, cur?.id]);
-
+  // Watched once it's actually on screen, not while it's still loading.
   useEffect(() => {
-    if (!cur || cur.video || paused) return;
+    if (ready && cur.media_id) seen.current.set(cur.id, { media_id: cur.media_id, taken_at: cur.taken_at });
+  }, [ready, cur?.id]);
+
+  // A picture's five seconds start when it has loaded.
+  useEffect(() => {
+    if (!cur || cur.video || paused || !ready) return;
     let last = performance.now();
     let raf;
     const tick = (now) => {
@@ -1105,7 +1158,7 @@ function Stories({ username, highlight, user, onClose }) {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [i, cur?.id, paused]);
+  }, [i, cur?.id, paused, ready]);
 
   useEffect(() => {
     const v = video.current;
@@ -1194,10 +1247,20 @@ function Stories({ username, highlight, user, onClose }) {
                   poster=${cur.img}
                   playsinline
                   autoplay
+                  onLoadedData=${() => setArrived(cur.id)}
+                  onPlaying=${() => setArrived(cur.id)}
                   onTimeUpdate=${(e) => e.target.duration && setProgress(e.target.currentTime / e.target.duration)}
                   onEnded=${next}
                 ></video>`
-              : html`<img key=${cur.id} src=${cur.img} referrerpolicy="no-referrer" alt="" />`}
+              : html`<img
+                  key=${`${cur.id}${blocked === cur.id ? "-via" : ""}`}
+                  src=${(blocked === cur.id && viaServer(cur.img)) || cur.img}
+                  referrerpolicy="no-referrer"
+                  alt=""
+                  onLoad=${() => setArrived(cur.id)}
+                  onError=${() => (blocked !== cur.id && viaServer(cur.img) ? setBlocked(cur.id) : setArrived(cur.id))}
+                />`}
+            ${!ready && html`<div class="spinner story-wait"></div>`}
           </div>
           ${!mineStory &&
           html`<form class=${`story-foot ${replying ? "typing" : ""}`} onSubmit=${sendReply}>
@@ -1338,25 +1401,42 @@ function Today() {
     return () => clearTimeout(t);
   }, [nearEnd, next, loading]);
 
-  const ptr = usePullToRefresh(
-    useCallback(async () => {
-      api("/api/daily/stories?fresh=1").then(setStories).catch(() => {});
-      try {
-        const r = await api("/api/daily/feed?fresh=1");
-        if (r.spent) {
-          setSpent(true);
-          toast("That's enough feed for today");
-          return;
-        }
-        shown.current = new Set(r.items.map((m) => m.id));
-        lastLoad.current = Date.now();
-        setPosts(r.items);
-        setNext(r.next);
-      } catch (e) {
-        fail(e);
+  // New posts go on top of what's already here. With nothing new the list (and
+  // where it had got to) stays as it is, rather than walking the same pages again.
+  // Resolves to how many posts were new.
+  const refresh = useCallback(async () => {
+    api("/api/daily/stories?fresh=1").then((x) => mounted.current && setStories(x)).catch(() => {});
+    try {
+      const r = await api("/api/daily/feed?fresh=1");
+      if (!mounted.current) return;
+      if (r.spent) {
+        setSpent(true);
+        toast("That's enough feed for today");
+        return;
       }
-    }, [])
-  );
+      const fresh = r.items.filter((m) => !shown.current.has(m.id));
+      if (!fresh.length) return toast(r.wait ? `Just checked. Try again in ${r.wait}s` : "No new posts yet"), 0;
+      const top = new Set(r.items.map((m) => m.id));
+      fresh.forEach((m) => shown.current.add(m.id));
+      lastLoad.current = Date.now();
+      setPosts((p) => [...r.items, ...(p || []).filter((m) => !top.has(m.id))]);
+      setNext(r.next);
+      toast(fresh.length === 1 ? "1 new post" : `${fresh.length} new posts`);
+      return fresh.length;
+    } catch (e) {
+      fail(e);
+    }
+  }, []);
+  const ptr = usePullToRefresh(refresh);
+  // The same refresh from the end of the feed, where there's nothing to pull.
+  const [checking, setChecking] = useState(false);
+  const check = async () => {
+    setChecking(true);
+    const added = await refresh();
+    if (!mounted.current) return;
+    setChecking(false);
+    if (added) window.scrollTo({ top: 0, behavior: "smooth" });
+  };
 
   const start = () => api("/api/daily/start", { method: "POST" }).then(apply).catch(setError);
   const update = useCallback((nm) => setPosts((p) => p && p.map((x) => (x.id === nm.id ? nm : x))), []);
@@ -1408,7 +1488,11 @@ function Today() {
     <div ref=${sentinel} class="sentinel"></div>
     ${posts !== null && (next || loading)
       ? html`<${Spinner} />`
-      : posts?.length > 0 && html`<p class="caught-up muted">${I.check} ${spent ? "That's enough feed for today" : "That's everything for now. Pull down for new posts."}</p>`}
+      : posts?.length > 0 &&
+        html`<div class="caught-up muted">
+          <p>${I.check} ${spent ? "That's enough feed for today" : "That's everything for now"}</p>
+          ${!spent && html`<button class="btn secondary small" disabled=${checking} onClick=${check}>${checking ? "Checking…" : "Check for new posts"}</button>`}
+        </div>`}
     ${viewer &&
     html`<${Stories}
       key=${viewer.id}
